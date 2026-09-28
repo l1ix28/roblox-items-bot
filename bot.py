@@ -2,7 +2,7 @@ import os
 import time
 import requests
 
-# Récupération sécurisée du Webhook depuis l'environnement (Render / Système)
+# Récupération sécurisée du Webhook depuis Railway
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 if not WEBHOOK_URL:
@@ -13,14 +13,31 @@ if not WEBHOOK_URL:
 seen_item_ids = set()
 
 def get_latest_limiteds():
-    # Endpoint de l'API Catalogue Roblox pour chercher des objets récents
+    # URL de l'API Catalogue Roblox
     url = "https://catalog.roblox.com/v1/search/items/details?category=11&salesTypeFilter=1&sortType=3&limit=10"
     
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            return data.get("data", [])
+            items = data.get("data", [])
+            
+            official_limiteds = []
+            for item in items:
+                # 1. Vérifier si c'est un Limited / Collectible
+                restrictions = item.get("itemRestrictions", [])
+                is_collectible = "Collectible" in restrictions or "Limited" in restrictions or item.get("isLimited") == True
+                
+                if is_collectible:
+                    # 2. Vérifier si le créateur est officiellement Roblox
+                    creator_id = item.get("creatorId")
+                    creator_name = item.get("creatorName", "")
+                    
+                    # On filtre pour ne garder que les objets publiés par Roblox (ID 1 ou nom "Roblox")
+                    if creator_name == "Roblox" or creator_id == 1:
+                        official_limiteds.append(item)
+                        
+            return official_limiteds
     except Exception as e:
         print(f"Erreur lors de la requête API : {e}")
     return []
@@ -39,15 +56,15 @@ def send_discord_alert(item):
 
     # Format de l'embed Discord
     embed = {
-        "title": "🚨 NOUVEAU LIMITED / UGC DÉTECTÉ !",
+        "title": "🚨 OFFICIEL ROBLOX LIMITED DÉTECTÉ !",
         "description": f"**[{item_name}]({item_url})**",
-        "color": 16711680, # Couleur rouge/orange
+        "color": 16711680, # Rouge
         "fields": [
             {"name": "💰 Prix", "value": f"{item_price} Robux", "inline": True},
             {"name": "📦 Type", "value": f"{item_type}", "inline": True}
         ],
         "image": {"url": thumb_url},
-        "footer": {"text": "Roblox Limited Notifier Bot"}
+        "footer": {"text": "Roblox Official Limited Notifier"}
     }
 
     payload = {"embeds": [embed]}
@@ -55,13 +72,13 @@ def send_discord_alert(item):
     try:
         response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         if response.status_code == 204 or response.status_code == 200:
-            print(f"Alerte envoyée avec succès pour : {item_name}")
+            print(f"Alerte envoyée avec succès pour l'item officiel : {item_name}")
         else:
             print(f"Erreur Discord (Code {response.status_code}): {response.text}")
     except Exception as e:
         print(f"Erreur d'envoi du webhook : {e}")
 
-print("Bot de surveillance des Limiteds démarré...")
+print("Bot de surveillance des Limiteds Officiels Roblox démarré...")
 
 # Boucle principale du bot
 while True:
@@ -69,14 +86,14 @@ while True:
     for item in items:
         item_id = item.get("id")
         if item_id and item_id not in seen_item_ids:
-            # Marquer comme vu pour éviter le spam au prochain tour
+            # Marquer comme vu pour éviter le spam
             seen_item_ids.add(item_id)
             
-            # Empêcher le set de grandir indéfiniment en mémoire (garder les 500 derniers)
+            # Garder une limite de 500 IDs en mémoire
             if len(seen_item_ids) > 500:
                 seen_item_ids.pop()
                 
-            # Envoyer l'alerte
+            # Envoyer l'alerte sur Discord
             send_discord_alert(item)
 
     # Pause de 60 secondes pour éviter le rate limit de l'API Roblox
