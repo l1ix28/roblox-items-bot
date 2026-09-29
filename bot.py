@@ -2,14 +2,14 @@ import os
 import time
 import requests
 
-# Récupération sécurisée du Webhook depuis Railway
+# Récupération du Webhook depuis Railway
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 if not WEBHOOK_URL:
     print("Erreur critique : La variable d'environnement WEBHOOK_URL n'est pas définie !")
     exit(1)
 
-# Ensemble pour stocker les IDs des items déjà détectés (pour éviter les doublons)
+# On stock les IDs des items déjà détectés (pas de doublons)
 seen_item_ids = set()
 
 def get_latest_roblox_items():
@@ -28,7 +28,7 @@ def get_latest_roblox_items():
                 creator_id = item.get("creatorId")
                 creator_name = item.get("creatorName", "")
                 
-                # On garde tous les objets publiés par Roblox (qu'ils soient limited ou non)
+                # On garde tous les objets publiés par Roblox (limited ou non)
                 if creator_name == "Roblox" or creator_id == 1:
                     roblox_items.append(item)
                         
@@ -47,13 +47,13 @@ def send_discord_alert(item):
     restrictions = item.get("itemRestrictions", [])
     is_collectible = "Collectible" in restrictions or "Limited" in restrictions or item.get("isLimited") == True
     
-    title_text = "🚨 NOUVEAU LIMITED ROBLOX !" if is_collectible else "📦 NOUVEL OBJET ROBLOX !"
+    title_text = "🚨 NEW ROBLOX LIMITED !" if is_collectible else "📦 NEW ROBLOX ITEM !"
     color_code = 16711680 if is_collectible else 3447003 # Rouge pour limited, Bleu pour normal
 
-    # Construction du lien direct vers l'item sur le catalogue Roblox
+    # Lien direct vers l'item sur le catalogue Roblox
     item_url = f"https://www.roblox.com/catalog/{item_id}"
     
-    # Génération de la miniature via l'API Roblox
+    # Génération de la minia via l'API Roblox
     thumb_url = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
 
     # Format de l'embed Discord
@@ -98,5 +98,5 @@ while True:
             # Envoyer l'alerte sur Discord
             send_discord_alert(item)
 
-    # Pause de 60 secondes pour éviter le rate limit de l'API Roblox
-    time.sleep(60)
+    # Pause de 20 secondes pour éviter le rate limit 
+    time.sleep(20)
