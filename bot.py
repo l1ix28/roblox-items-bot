@@ -2,18 +2,18 @@ import os
 import time
 import requests
 
-# Récupération du Webhook depuis Railway
+# Retrieve webhook URL from environment variables
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 if not WEBHOOK_URL:
-    print("Erreur critique : La variable d'environnement WEBHOOK_URL n'est pas définie !")
+    print("Critical Error: WEBHOOK_URL environment variable is not defined!")
     exit(1)
 
-# On stock les IDs des items déjà détectés (pas de doublons)
+# Store seen item IDs to prevent duplicate alerts
 seen_item_ids = set()
 
 def get_latest_roblox_items():
-    # URL de l'API Catalogue Roblox
+    # Roblox Catalog API endpoint
     url = "https://catalog.roblox.com/v1/search/items/details?category=11&salesTypeFilter=1&sortType=3&limit=10"
     
     try:
@@ -24,45 +24,45 @@ def get_latest_roblox_items():
             
             roblox_items = []
             for item in items:
-                # Vérifier si le créateur est officiellement Roblox
+                # Check if the creator is officially Roblox
                 creator_id = item.get("creatorId")
                 creator_name = item.get("creatorName", "")
                 
-                # On garde tous les objets publiés par Roblox (limited ou non)
+                # Keep all items published by Roblox (limited or not)
                 if creator_name == "Roblox" or creator_id == 1:
                     roblox_items.append(item)
                         
             return roblox_items
     except Exception as e:
-        print(f"Erreur lors de la requête API : {e}")
+        print(f"Error during API request: {e}")
     return []
 
 def send_discord_alert(item):
     item_id = item.get("id")
-    item_name = item.get("name", "Objet inconnu")
-    item_price = item.get("price", "Gratuit / Inconnu")
+    item_name = item.get("name", "Unknown item")
+    item_price = item.get("price", "Free / Unknown")
     item_type = item.get("itemType", "Asset")
     
-    # Vérifier si l'objet est un limited pour adapter le titre de l'alerte
+    # Check if the item is a limited to adapt the alert title
     restrictions = item.get("itemRestrictions", [])
     is_collectible = "Collectible" in restrictions or "Limited" in restrictions or item.get("isLimited") == True
     
     title_text = "🚨 NEW ROBLOX LIMITED !" if is_collectible else "📦 NEW ROBLOX ITEM !"
-    color_code = 16711680 if is_collectible else 3447003 # Rouge pour limited, Bleu pour normal
+    color_code = 16711680 if is_collectible else 3447003 # Red for limited, Blue for normal
 
-    # Lien direct vers l'item sur le catalogue Roblox
+    # Direct link to the item on the Roblox catalog
     item_url = f"https://www.roblox.com/catalog/{item_id}"
     
-    # Génération de la minia via l'API Roblox
+    # Generate thumbnail via Roblox API
     thumb_url = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
 
-    # Format de l'embed Discord
+    # Discord embed structure
     embed = {
         "title": title_text,
         "description": f"**[{item_name}]({item_url})**",
         "color": color_code,
         "fields": [
-            {"name": "💰 Prix", "value": f"{item_price} Robux", "inline": True},
+            {"name": "💰 Price", "value": f"{item_price} Robux", "inline": True},
             {"name": "📦 Type", "value": f"{item_type}", "inline": True}
         ],
         "image": {"url": thumb_url},
@@ -74,29 +74,29 @@ def send_discord_alert(item):
     try:
         response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         if response.status_code == 204 or response.status_code == 200:
-            print(f"Alerte envoyée pour l'item Roblox : {item_name}")
+            print(f"Alert sent for Roblox item: {item_name}")
         else:
-            print(f"Erreur Discord (Code {response.status_code}): {response.text}")
+            print(f"Discord Error (Code {response.status_code}): {response.text}")
     except Exception as e:
-        print(f"Erreur d'envoi du webhook : {e}")
+        print(f"Error sending webhook: {e}")
 
-print("Bot de surveillance des items officiels Roblox démarré...")
+print("Official Roblox item monitoring bot started...")
 
-# Boucle principale du bot
+# Main bot loop
 while True:
     items = get_latest_roblox_items()
     for item in items:
         item_id = item.get("id")
         if item_id and item_id not in seen_item_ids:
-            # Marquer comme vu pour éviter le spam
+            # Mark as seen to prevent spam
             seen_item_ids.add(item_id)
             
-            # Garder une limite de 500 IDs en mémoire
+            # Keep a maximum limit of 500 IDs in memory
             if len(seen_item_ids) > 500:
                 seen_item_ids.pop()
                 
-            # Envoyer l'alerte sur Discord
+            # Send alert to Discord
             send_discord_alert(item)
 
-    # Pause de 20 secondes pour éviter le rate limit 
+    # 20-second pause to avoid rate limits
     time.sleep(20)
