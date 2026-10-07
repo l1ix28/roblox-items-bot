@@ -1,136 +1,212 @@
 import os
 import time
 import requests
+from datetime import datetime, timedelta, timezone
 
-# Retrieve webhook URL from environment variables
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-
 if not WEBHOOK_URL:
     print("Critical Error: WEBHOOK_URL environment variable is not defined!")
-    exit(1)
+    raise SystemExit(1)
 
-# Store known items with their previous limited status to detect when an old item turns limited
-tracked_items = {}
+# ---------------- Réglages ----------------
+SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 items par page)
+NEW_DAYS = 7                   # un item créé il y a moins de X jours compte comme "nouveau"
+ALERT_NEW_NON_LIMITED = False  # True = alerter aussi sur les nouveaux items Roblox non limited
+TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
+INTERVAL = 20                  # secondes entre deux vérifications
 
-def get_latest_roblox_items():
-    # Roblox Catalog API endpoint
-    url = "https://catalog.roblox.com/v1/search/items/details?category=11&salesTypeFilter=1&sortType=3&limit=30"
-    
+API_URL = "https://catalog.roblox.com/v1/search/items/details"
+BASE_PARAMS = {
+    "Category": 1,             # 1 = tout
+    "CreatorTargetId": 1,      # 1 = le compte Roblox
+    "CreatorType": "User",     # obligatoire avec CreatorTargetId
+    "SortType": 3,             # 3 = Updated (les plus récemment modifiés d'abord)
+    "Limit": 30,
+}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/1.0)"}
+LIMITED_TAGS = {"Collectible", "Limited", "LimitedUnique"}
+
+tracked_items = {}  # id -> True si l'item est limited
+
+
+def is_limited(item):
+    return bool(LIMITED_TAGS.intersection(item.get("itemRestrictions") or []))
+
+
+def is_recent(item):
+    created = item.get("itemCreatedUtc")
+    if not created:
+        return False
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            items = data.get("data", [])
-            
-            roblox_items = []
-            for item in items:
-                creator_id = item.get("creatorId")
-                creator_name = item.get("creatorName", "")
-                
-                # Keep items published officially by Roblox
-                if creator_name == "Roblox" or creator_id == 1:
-                    roblox_items.append(item)
-                        
-            return roblox_items
+        dt = datetime.strptime(created.split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False
+    dt = dt.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - dt < timedelta(days=NEW_DAYS)
+
+
+def fetch_page(cursor=None):
+    """Retourne (items, curseur de la page suivante), ou (None, None) si la requête a échoué."""
+    params = dict(BASE_PARAMS)
+    if cursor:
+        params["Cursor"] = cursor
+    try:
+        response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
     except Exception as e:
-        print(f"Error during API request: {e}")
-    return []
+        print(f"Erreur réseau : {e}")
+        return None, None
 
-def send_discord_alert(item, is_new=True, became_limited=False):
-    item_id = item.get("id")
-    item_name = item.get("name", "Unknown item")
-    item_price = item.get("price", 0)
-    
-    # Determine item type description (e.g., "New Roblox Hat")
-    bundle_type = item.get("itemType", "Asset")
-    description_text = f"New Roblox {bundle_type}"
-    
-    # Check restrictions and stock limit (if available)
-    restrictions = item.get("itemRestrictions", [])
-    is_collectible = "Collectible" in restrictions or "Limited" in restrictions or item.get("isLimited") == True
-    
-    # Look for stock limit if it's a limited item
+    if response.status_code == 429:
+        wait = int(response.headers.get("Retry-After", 60))
+        print(f"Limite de requêtes Roblox (429), pause de {wait}s")
+        time.sleep(wait)
+        return None, None
+    if response.status_code != 200:
+        print(f"Erreur API Roblox {response.status_code} : {response.text[:200]}")
+        return None, None
+
+    body = response.json()
+    items = [
+        i for i in body.get("data", [])
+        if i.get("creatorTargetId") == 1 and i.get("creatorType", "User") == "User"
+    ]
+    return items, body.get("nextPageCursor")
+
+
+def seed_tracked_items():
+    """Mémorise l'état actuel des items sans envoyer d'alerte."""
+    cursor = None
+    count = 0
+    for _ in range(SEED_PAGES):
+        items, cursor = fetch_page(cursor)
+        if items is None:
+            break
+        for item in items:
+            if item.get("id"):
+                tracked_items[item["id"]] = is_limited(item)
+        count += len(items)
+        if not cursor:
+            break
+        time.sleep(1.5)
+    limited_count = sum(1 for v in tracked_items.values() if v)
+    print(f"Démarrage : {count} items Roblox mémorisés ({limited_count} limited), sans alerte.")
+
+
+def get_thumbnail(item):
+    item_id = item["id"]
+    if item.get("itemType") == "Bundle":
+        url = "https://thumbnails.roblox.com/v1/bundles/thumbnails"
+        params = {"bundleIds": item_id, "size": "420x420", "format": "Png"}
+    else:
+        url = "https://thumbnails.roblox.com/v1/assets"
+        params = {"assetIds": item_id, "size": "420x420", "format": "Png"}
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data and data[0].get("imageUrl"):
+                return data[0]["imageUrl"]
+    except Exception as e:
+        print(f"Erreur miniature : {e}")
+    return None
+
+
+def send_discord_alert(item, reason):
+    """reason : "new_limited", "now_limited" ou "new_item"."""
+    item_id = item["id"]
+    name = item.get("name", "Unknown item")
+    price = item.get("price") or 0
+    is_bundle = item.get("itemType") == "Bundle"
+    kind = "Bundle" if is_bundle else "Item"
+    item_url = f"https://www.roblox.com/{'bundles' if is_bundle else 'catalog'}/{item_id}"
+
+    if reason == "new_limited":
+        label, color = f"New Roblox Limited {kind}", 3447003
+    elif reason == "now_limited":
+        label, color = f"Roblox {kind} just became Limited", 15105570
+    else:
+        label, color = f"New Roblox {kind}", 3447003
+
     stock_text = ""
-    # Roblox sometimes provides quantity limit in restriction or specific fields
-    quantity = item.get("unitsAvailable") or item.get("remaining")
-    if is_collectible and quantity:
-        stock_text = f" 🇦🇹 Limit {quantity}"
-    elif is_collectible:
-        stock_text = " 🇦🇹 Limited"
+    if is_limited(item):
+        stock = item.get("totalQuantity") or 0
+        stock_text = f" 📦 Stock: {stock}" if stock > 0 else " 📦 Limited"
 
-    # Links
-    item_url = f"https://www.roblox.com/catalog/{item_id}"
-    # Try-on link redirecting to the catalog item page or avatar shop view
-    try_on_url = f"https://www.roblox.com/catalog/{item_id}" 
-    
-    # Thumbnail image
-    thumb_url = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
-
-    # Color code (Blue bar on the left like Rolimon's)
-    color_code = 3447003 
-
-    # Build description mimicking the screenshot layout
-    desc_markdown = f"**[{item_name}]({item_url})**\n{description_text}{stock_text}\n🌐 [Roblox Page]({item_url})  👕 [Try On]({try_on_url})"
+    price_text = f"{price} Robux" if price > 0 else (item.get("priceStatus") or "Free")
 
     embed = {
-        "description": desc_markdown,
-        "color": color_code,
-        "thumbnail": {"url": thumb_url},
+        "description": f"**[{name}]({item_url})**\n{label}{stock_text}\n🌐 [Roblox Page]({item_url})",
+        "color": color,
         "fields": [
-            {
-                "name": "Creator",
-                "value": "[Roblox](https://www.roblox.com/users/1/profile)",
-                "inline": False
-            },
-            {
-                "name": "💰 Price",
-                "value": f"{item_price} Robux" if item_price > 0 else "Free",
-                "inline": True
-            }
+            {"name": "Creator", "value": "[Roblox](https://www.roblox.com/users/1/profile)", "inline": False},
+            {"name": "💰 Price", "value": price_text, "inline": True},
         ],
-        "footer": {"text": "Roblox Catalog Notifier"}
+        "footer": {"text": "Roblox Catalog Notifier"},
     }
+    thumb = get_thumbnail(item)
+    if thumb:
+        embed["thumbnail"] = {"url": thumb}
 
-    payload = {"embeds": [embed]}
-    
     try:
-        response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-        if response.status_code in [200, 204]:
-            print(f"Alert sent for: {item_name}")
+        response = requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        if response.status_code in (200, 204):
+            print(f"Alerte envoyée ({reason}) : {name}")
         else:
-            print(f"Discord Error ({response.status_code}): {response.text}")
+            print(f"Erreur Discord ({response.status_code}) : {response.text[:200]}")
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"Erreur webhook : {e}")
 
-print("Roblox style-matched monitoring bot started...")
 
-# Main loop with tracking mechanism for old items turning limited
+print("Bot de surveillance Roblox démarré...")
+seed_tracked_items()
+first_check = True
+
 while True:
-    items = get_latest_roblox_items()
-    
+    items, _ = fetch_page()
+
+    if items is None:
+        time.sleep(INTERVAL)
+        continue
+
+    top = ", ".join(i.get("name", "?") for i in items[:3])
+    print(f"[{time.strftime('%H:%M:%S')}] {len(items)} items Roblox reçus. Début : {top}")
+
+    if first_check:
+        first_check = False
+        if TEST_ON_START and items:
+            send_discord_alert(items[0], "new_limited")
+            print("Alerte test envoyée pour vérifier le webhook.")
+
+    alerts = []
     for item in items:
         item_id = item.get("id")
         if not item_id:
             continue
-            
-        restrictions = item.get("itemRestrictions", [])
-        is_collectible = "Collectible" in restrictions or "Limited" in restrictions or item.get("isLimited") == True
-        
-        # If the item is completely new to the bot
-        if item_id not in tracked_items:
-            tracked_items[item_id] = is_collectible
-            send_discord_alert(item, is_new=True)
-            
-        # If an existing item suddenly switches to limited/collectible
-        elif tracked_items[item_id] == False and is_collectible == True:
-            tracked_items[item_id] = True
-            send_discord_alert(item, is_new=False, became_limited=True)
 
-    # Clean up memory if dictionary gets too large
-    if len(tracked_items) > 1000:
-        keys_to_remove = list(tracked_items.keys())[:200]
-        for k in keys_to_remove:
-            del tracked_items[k]
+        limited = is_limited(item)
+        was_limited = tracked_items.get(item_id)  # None = jamais vu
+        reason = None
 
-    # 20-second interval to stay safe from rate limits
-    time.sleep(20)
+        if was_limited is None:
+            # item jamais vu : nouveau, ou ancien item qui remonte dans les modifiés
+            if limited:
+                reason = "new_limited" if is_recent(item) else "now_limited"
+            elif ALERT_NEW_NON_LIMITED and is_recent(item):
+                reason = "new_item"
+        elif not was_limited and limited:
+            reason = "now_limited"  # il n'était pas limited, il l'est devenu
+
+        tracked_items[item_id] = limited
+        if reason:
+            alerts.append((item, reason))
+
+    for item, reason in reversed(alerts):  # du plus ancien au plus récent
+        send_discord_alert(item, reason)
+        time.sleep(1)
+
+    # on évite que la mémoire grossisse indéfiniment
+    if len(tracked_items) > 2000:
+        for key in list(tracked_items)[:500]:
+            del tracked_items[key]
+
+    time.sleep(INTERVAL)
