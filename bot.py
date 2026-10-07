@@ -13,7 +13,8 @@ SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 it
 NEW_DAYS = 7                   # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = False  # True = alerter aussi sur les nouveaux items Roblox non limited
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
-INTERVAL = 20                  # secondes entre deux vérifications
+INTERVAL = 30                  # secondes entre deux vérifications (monte à 60 si les 429 restent fréquents)
+RETRIES = 4                    # essais par requête en cas de 429
 
 API_URL = "https://catalog.roblox.com/v1/search/items/details"
 BASE_PARAMS = {
@@ -45,51 +46,69 @@ def is_recent(item):
     return datetime.now(timezone.utc) - dt < timedelta(days=NEW_DAYS)
 
 
+def retry_delay(response, attempt):
+    try:
+        base = int(response.headers.get("Retry-After", 5))
+    except ValueError:
+        base = 5
+    return base + attempt * 3
+
+
 def fetch_page(cursor=None):
     """Retourne (items, curseur de la page suivante), ou (None, None) si la requête a échoué."""
     params = dict(BASE_PARAMS)
     if cursor:
         params["Cursor"] = cursor
-    try:
-        response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
-    except Exception as e:
-        print(f"Erreur réseau : {e}")
-        return None, None
 
-    if response.status_code == 429:
-        wait = int(response.headers.get("Retry-After", 60))
-        print(f"Limite de requêtes Roblox (429), pause de {wait}s")
-        time.sleep(wait)
-        return None, None
-    if response.status_code != 200:
-        print(f"Erreur API Roblox {response.status_code} : {response.text[:200]}")
-        return None, None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
+        except Exception as e:
+            print(f"Erreur réseau : {e}")
+            time.sleep(5)
+            continue
 
-    body = response.json()
-    items = [
-        i for i in body.get("data", [])
-        if i.get("creatorTargetId") == 1 and i.get("creatorType", "User") == "User"
-    ]
-    return items, body.get("nextPageCursor")
+        if response.status_code == 429:
+            wait = retry_delay(response, attempt)
+            print(f"Limite de requêtes Roblox (429), nouvel essai dans {wait}s ({attempt}/{RETRIES})")
+            time.sleep(wait)
+            continue
+
+        if response.status_code != 200:
+            print(f"Erreur API Roblox {response.status_code} : {response.text[:200]}")
+            return None, None
+
+        body = response.json()
+        items = [
+            i for i in body.get("data", [])
+            if i.get("creatorTargetId") == 1 and i.get("creatorType", "User") == "User"
+        ]
+        return items, body.get("nextPageCursor")
+
+    print("Requête abandonnée après plusieurs essais, on réessaiera au prochain tour.")
+    return None, None
 
 
 def seed_tracked_items():
     """Mémorise l'état actuel des items sans envoyer d'alerte."""
     cursor = None
     count = 0
+    pages = 0
     for _ in range(SEED_PAGES):
         items, cursor = fetch_page(cursor)
         if items is None:
+            print("Mémorisation interrompue, on continue avec ce qu'on a déjà.")
             break
         for item in items:
             if item.get("id"):
                 tracked_items[item["id"]] = is_limited(item)
         count += len(items)
+        pages += 1
         if not cursor:
             break
-        time.sleep(1.5)
+        time.sleep(3)
     limited_count = sum(1 for v in tracked_items.values() if v)
-    print(f"Démarrage : {count} items Roblox mémorisés ({limited_count} limited), sans alerte.")
+    print(f"Démarrage : {count} items Roblox mémorisés ({limited_count} limited, {pages}/{SEED_PAGES} pages), sans alerte.")
 
 
 def get_thumbnail(item):
@@ -169,7 +188,7 @@ while True:
         continue
 
     top = ", ".join(i.get("name", "?") for i in items[:3])
-    print(f"[{time.strftime('%H:%M:%S')}] {len(items)} items Roblox reçus. Début : {top}")
+    print(f"[{time.strftime('%H:%M:%S')} UTC] {len(items)} items Roblox reçus. Début : {top}")
 
     if first_check:
         first_check = False
