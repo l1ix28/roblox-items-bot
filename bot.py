@@ -10,13 +10,15 @@ if not WEBHOOK_URL:
     raise SystemExit(1)
 
 # ---------------- Réglages ----------------
+MIN_REQUEST_GAP = 20           # secondes minimum entre deux requêtes vers le catalogue Roblox
+WATCHLIST_EVERY = 3            # la watchlist est vérifiée 1 tour sur 3 (1 = à chaque tour)
 SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 items par page)
 NEW_DAYS = 7                   # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = False  # True = alerter aussi sur les nouveaux items Roblox non limited
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
 INCLUDE_OFFSALE = True         # inclut les items hors vente dans la recherche (mets False si l'API renvoie une erreur 400)
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
-INTERVAL = 60                  # secondes entre deux vérifications
+INTERVAL = 5                   # pause supplémentaire entre deux tours (le délai de 20s entre requêtes s'applique déjà)
 RETRIES = 4                    # essais par requête en cas de 429
 
 # Items surveillés en plus, même s'ils ne sont pas modifiés récemment.
@@ -42,9 +44,19 @@ LIMITED_TAGS = {"Collectible", "Limited", "LimitedUnique"}
 
 tracked_items = {}   # "Type:id" -> {"limited": bool, "on_sale": bool}
 csrf_token = None
+last_request_time = 0.0
 
 
 # ---------------- Outils ----------------
+def throttle():
+    """Attend si besoin pour qu'il y ait au moins MIN_REQUEST_GAP secondes entre deux requêtes Roblox."""
+    global last_request_time
+    wait = MIN_REQUEST_GAP - (time.time() - last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    last_request_time = time.time()
+
+
 def item_key(item):
     return f"{item.get('itemType', 'Asset')}:{item.get('id')}"
 
@@ -90,12 +102,13 @@ def debug_item(item):
     )
 
 
-def retry_delay(response, attempt):
+def backoff_delay(response, attempt):
+    """Pause supplémentaire après un 429 (en plus des 20s déjà imposées par throttle)."""
     try:
-        base = int(response.headers.get("Retry-After", 5))
+        base = int(response.headers.get("Retry-After", 10))
     except ValueError:
-        base = 5
-    return base + attempt * 3
+        base = 10
+    return base + attempt * 10
 
 
 # ---------------- Requêtes Roblox ----------------
@@ -106,16 +119,16 @@ def fetch_page(cursor=None):
         params["Cursor"] = cursor
 
     for attempt in range(1, RETRIES + 1):
+        throttle()
         try:
             response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
         except Exception as e:
             print(f"Erreur réseau : {e}")
-            time.sleep(5)
             continue
 
         if response.status_code == 429:
-            wait = retry_delay(response, attempt)
-            print(f"Limite de requêtes Roblox (429), nouvel essai dans {wait}s ({attempt}/{RETRIES})")
+            wait = backoff_delay(response, attempt)
+            print(f"Limite de requêtes Roblox (429), pause de {wait}s puis nouvel essai ({attempt}/{RETRIES})")
             time.sleep(wait)
             continue
 
@@ -146,11 +159,12 @@ def fetch_watchlist():
         headers = dict(HEADERS)
         if csrf_token:
             headers["x-csrf-token"] = csrf_token
+
+        throttle()
         try:
             response = requests.post(DETAILS_URL, json=payload, headers=headers, timeout=10)
         except Exception as e:
             print(f"Erreur réseau (watchlist) : {e}")
-            time.sleep(5)
             continue
 
         if response.status_code == 403 and response.headers.get("x-csrf-token"):
@@ -158,8 +172,8 @@ def fetch_watchlist():
             continue
 
         if response.status_code == 429:
-            wait = retry_delay(response, attempt)
-            print(f"Limite de requêtes Roblox (429) sur la watchlist, nouvel essai dans {wait}s")
+            wait = backoff_delay(response, attempt)
+            print(f"Limite de requêtes Roblox (429) sur la watchlist, pause de {wait}s puis nouvel essai")
             time.sleep(wait)
             continue
 
@@ -198,18 +212,18 @@ def evaluate(item):
 
 
 def seed_tracked_items():
-    """Mémorise l'état actuel des items sans envoyer d'alerte (patient face aux erreurs 429)."""
+    """Mémorise l'état actuel des items sans envoyer d'alerte."""
     cursor = None
     count = 0
     pages = 0
     for _ in range(SEED_PAGES):
         items, next_cursor = None, None
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             items, next_cursor = fetch_page(cursor)
             if items is not None:
                 break
-            print(f"Mémorisation : page {pages + 1} indisponible, nouvel essai dans 20s ({attempt}/3)")
-            time.sleep(20)
+            print(f"Mémorisation : page {pages + 1} indisponible, nouvel essai dans 30s ({attempt}/2)")
+            time.sleep(30)
 
         if items is None:
             print("Mémorisation interrompue, on continue avec ce qu'on a déjà.")
@@ -228,7 +242,6 @@ def seed_tracked_items():
         cursor = next_cursor
         if not cursor:
             break
-        time.sleep(10)
 
     limited_count = sum(1 for v in tracked_items.values() if v["limited"])
     on_sale_count = sum(1 for v in tracked_items.values() if v["on_sale"])
@@ -326,10 +339,15 @@ def send_discord_alert(item, reason):
 print("Bot de surveillance Roblox démarré...")
 seed_tracked_items()
 first_check = True
+loop_count = 0
 
 while True:
     items, _ = fetch_page()
-    watch_items = fetch_watchlist()
+
+    watch_items = []
+    if WATCHLIST and loop_count % WATCHLIST_EVERY == 0:
+        watch_items = fetch_watchlist()
+    loop_count += 1
 
     if items is None and not watch_items:
         time.sleep(INTERVAL)
