@@ -16,7 +16,7 @@ ALERT_NEW_NON_LIMITED = False  # True = alerter aussi sur les nouveaux items Rob
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
 INCLUDE_OFFSALE = True         # inclut les items hors vente dans la recherche (mets False si l'API renvoie une erreur 400)
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
-INTERVAL = 30                  # secondes entre deux vérifications (monte à 60 si les 429 restent fréquents)
+INTERVAL = 60                  # secondes entre deux vérifications
 RETRIES = 4                    # essais par requête en cas de 429
 
 # Items surveillés en plus, même s'ils ne sont pas modifiés récemment.
@@ -198,23 +198,37 @@ def evaluate(item):
 
 
 def seed_tracked_items():
-    """Mémorise l'état actuel des items sans envoyer d'alerte."""
+    """Mémorise l'état actuel des items sans envoyer d'alerte (patient face aux erreurs 429)."""
     cursor = None
     count = 0
     pages = 0
     for _ in range(SEED_PAGES):
-        items, cursor = fetch_page(cursor)
+        items, next_cursor = None, None
+        for attempt in range(1, 4):
+            items, next_cursor = fetch_page(cursor)
+            if items is not None:
+                break
+            print(f"Mémorisation : page {pages + 1} indisponible, nouvel essai dans 20s ({attempt}/3)")
+            time.sleep(20)
+
         if items is None:
             print("Mémorisation interrompue, on continue avec ce qu'on a déjà.")
             break
+
+        if pages == 0:
+            print("Exemples d'items reçus :")
+            for item in items[:5]:
+                debug_item(item)
+
         for item in items:
             if item.get("id"):
                 evaluate(item)
         count += len(items)
         pages += 1
+        cursor = next_cursor
         if not cursor:
             break
-        time.sleep(3)
+        time.sleep(10)
 
     limited_count = sum(1 for v in tracked_items.values() if v["limited"])
     on_sale_count = sum(1 for v in tracked_items.values() if v["on_sale"])
