@@ -13,7 +13,7 @@ if not WEBHOOK_URL:
 MIN_REQUEST_GAP = 45           # secondes minimum entre deux requêtes vers le catalogue Roblox
 WATCHLIST_EVERY = 3            # la watchlist est vérifiée 1 tour sur 3 (1 = à chaque tour)
 SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 items par page)
-NEW_DAYS = 7                   # un item créé il y a moins de X jours compte comme "nouveau"
+NEW_DAYS = 60                   # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = True  # True = alerter aussi sur les nouveaux items Roblox non limited
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
 INCLUDE_OFFSALE = True         # inclut les items hors vente dans la recherche (mets False si l'API renvoie une erreur 400)
