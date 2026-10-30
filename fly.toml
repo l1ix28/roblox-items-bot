@@ -1,4 +1,4 @@
 app = "roblox-items-bot"
-primary_region = "cdg" # ou ta région (ex: fra, ams...)
+primary_region = "fra" # ou ta région (ex: fra, ams...)
 
 [build]
