@@ -3,6 +3,29 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta, timezone
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# --- Mini serveur HTTP pour satisfaire Render (Web Service) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+    
+    def log_message(self, format, *args):
+        # Désactive les logs HTTP polluants dans la console
+        return
+
+def run_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Lance le serveur web en arrière-plan (thread daemon)
+server_thread = Thread(target=run_server, daemon=True)
+server_thread.start()
+print("Mini serveur HTTP démarré pour Render.")
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 if not WEBHOOK_URL:
@@ -13,8 +36,8 @@ if not WEBHOOK_URL:
 MIN_REQUEST_GAP = 45           # secondes minimum entre deux requêtes vers le catalogue Roblox
 WATCHLIST_EVERY = 3            # la watchlist est vérifiée 1 tour sur 3 (1 = à chaque tour)
 SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 items par page)
-NEW_DAYS = 60                   # un item créé il y a moins de X jours compte comme "nouveau"
-ALERT_NEW_NON_LIMITED = True  # True = alerter aussi sur les nouveaux items Roblox non limited
+NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
+ALERT_NEW_NON_LIMITED = True   # True = alerter aussi sur les nouveaux items Roblox non limited
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
 INCLUDE_OFFSALE = True         # inclut les items hors vente dans la recherche (mets False si l'API renvoie une erreur 400)
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
@@ -22,7 +45,7 @@ INTERVAL = 5                   # pause supplémentaire entre deux tours (le dél
 RETRIES = 2                    # essais par requête en cas de 429
 
 # Items surveillés en plus, même s'ils ne sont pas modifiés récemment.
-# ("Bundle", id) pour un lien roblox.com/bundles/ID/...   ("Asset", id) pour un lien roblox.com/catalog/ID/...
+# ("Bundle", id) pour un lien roblox.com/bundles/ID/...    ("Asset", id) pour un lien roblox.com/catalog/ID/...
 WATCHLIST = [
     ("Bundle", 319226),  # Korblox Deathwalker
 ]
