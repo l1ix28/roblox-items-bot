@@ -177,7 +177,16 @@ def normalize(value):
 
 
 def is_limited(item):
-    return bool(LIMITED_TAGS.intersection(item.get("itemRestrictions") or []))
+    # 1. Vérifie les tags classiques de restrictions
+    if bool(LIMITED_TAGS.intersection(item.get("itemRestrictions") or [])):
+        return True
+    # 2. Vérifie si l'item possède un ID collectible Roblox
+    if item.get("collectibleItemId"):
+        return True
+    # 3. Vérifie si l'item a explicitement un stock limité supérieur à 0 (ex: 0/13)
+    if (item.get("totalQuantity") or 0) > 0:
+        return True
+    return False
 
 
 def is_on_sale(item):
