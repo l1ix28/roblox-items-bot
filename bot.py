@@ -74,7 +74,7 @@ LIST_PARAMS = {
     "CreatorTargetId": 1,
     "CreatorType": "User",
     "SortType": 3,        # 3 = Updated (les plus récemment modifiés d'abord)
-    "Limit": 10,
+    "Limit": 30,
 }
 if INCLUDE_OFFSALE:
     LIST_PARAMS["IncludeNotForSale"] = "true"
@@ -135,13 +135,12 @@ def next_proxy(kind="list"):
 
 
 def current_gap():
-    """Délai fixe entre deux requêtes, sans division automatique par le nombre de proxies."""
+    """Délai entre deux requêtes de liste : divisé par le nombre de proxies actifs."""
     if not PROXIES:
         return MIN_REQUEST_GAP
     now = time.monotonic()
     active = sum(1 for p in PROXIES if proxy_cooldown.get(("list", p), 0) <= now)
-    # On retourne directement ton délai global minimum sans le diviser par 'active'
-    return MIN_REQUEST_GAP
+    return MIN_REQUEST_GAP / max(1, active)
 
 
 def retry_after(response):
