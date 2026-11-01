@@ -135,12 +135,13 @@ def next_proxy(kind="list"):
 
 
 def current_gap():
-    """Délai entre deux requêtes de liste : divisé par le nombre de proxies actifs."""
+    """Délai fixe entre deux requêtes, sans division automatique par le nombre de proxies."""
     if not PROXIES:
         return MIN_REQUEST_GAP
     now = time.monotonic()
     active = sum(1 for p in PROXIES if proxy_cooldown.get(("list", p), 0) <= now)
-    return MIN_REQUEST_GAP / max(1, active)
+    # On retourne directement ton délai global minimum sans le diviser par 'active'
+    return MIN_REQUEST_GAP
 
 
 def retry_after(response):
