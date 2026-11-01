@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
 
-# Affiche les logs tout de suite (sinon Render les regroupe et ils ont tous la même heure)
+# Affiche les logs tout de suite (sinon Render les regroupe)
 print = functools.partial(print, flush=True)
 
 
@@ -39,16 +39,19 @@ if not WEBHOOK_URL:
     raise SystemExit(1)
 
 # ---------------- Réglages ----------------
-# Délai fixé directement à 6.30 secondes pour chaque proxy
-MIN_REQUEST_GAP = 6.30
+# Délai (secondes) entre deux requêtes de liste, toutes IP confondues.
+# Plus c'est bas, plus tu détectes vite, mais plus tu consommes de bande passante proxy.
+LIST_INTERVAL = float(os.environ.get("LIST_INTERVAL", 6.3))
+# Roblox autorise 12 requêtes/minute/IP sur la liste : on ne dépasse jamais 1 requête / 5.2 s par IP.
+PER_IP_MIN_GAP = float(os.environ.get("PER_IP_MIN_GAP", 5.2))
 
-# Proxies (séparés par des virgules)
+# Proxies utilisés pour la LISTE (séparés par des virgules). Mets "direct" pour utiliser l'IP de Render.
 PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
 
 # ID du rôle Discord à ping pour les limiteds
 LIMITED_ROLE_ID = os.environ.get("LIMITED_ROLE_ID")
 
-REFRESH_EVERY_SECONDS = 8      # on revérifie les détails des tout derniers items
+REFRESH_EVERY_SECONDS = float(os.environ.get("REFRESH_EVERY_SECONDS", 10))  # revérifie les détails du haut de la liste
 REFRESH_TOP = 5                # nombre d'items du haut de la liste revérifiés
 NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = True   # alerter aussi sur les nouveaux items Roblox non limited
@@ -57,6 +60,11 @@ INCLUDE_OFFSALE = True         # inclut les items hors vente
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"
 RETRIES = 3
 DETAILS_ATTEMPTS = 6
+SEED_LIMIT = 30                # nombre d'items mémorisés au démarrage (une seule fois)
+
+# Détails et miniatures passent d'abord par l'IP de Render (gratuit en bande passante proxy),
+# puis par les proxies si Roblox y répond 429.
+DIRECT_FIRST = ("details", "thumb")
 
 # Items surveillés en plus
 WATCHLIST = [
@@ -75,17 +83,19 @@ LIST_PARAMS = {
 if INCLUDE_OFFSALE:
     LIST_PARAMS["IncludeNotForSale"] = "true"
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/3.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/4.0)"}
 LIMITED_TAGS = {"Collectible", "Limited", "LimitedUnique"}
 
 tracked_items = {}      # "Type:id" -> {"limited": bool, "on_sale": bool}
 known_order = None      # derniers IDs vus dans la liste
-csrf_token = None
+csrf_tokens = {}        # un jeton CSRF par proxy (un jeton obtenu via une IP n'est pas valable depuis une autre)
 limiter = None
 background_tasks = set()
 proxy_cycles = {}
 proxy_cooldown = {}     # (usage, proxy) -> instant jusqu'auquel on ne l'utilise plus
 poll_count = 0
+proxy_bytes = 0         # estimation de la bande passante consommée via les proxies
+START_TIME = time.monotonic()
 
 
 # ---------------- Limiteur de requêtes ----------------
@@ -112,15 +122,20 @@ class Limiter:
 
 
 def real_proxy(entry):
+    """"direct" = pas de proxy (IP de Render)."""
     return None if entry == "direct" else entry
 
 
 def next_proxy(kind="list"):
+    """Prochain accès pour cet usage ("list", "details", "thumb") qui n'est pas en pause."""
+    now = time.monotonic()
+    if kind in DIRECT_FIRST:
+        if not PROXIES or proxy_cooldown.get((kind, "direct"), 0) <= now:
+            return "direct"
     if not PROXIES:
         return None
     if kind not in proxy_cycles:
         proxy_cycles[kind] = itertools.cycle(PROXIES)
-    now = time.monotonic()
     for _ in range(len(PROXIES)):
         p = next(proxy_cycles[kind])
         if proxy_cooldown.get((kind, p), 0) <= now:
@@ -129,8 +144,12 @@ def next_proxy(kind="list"):
 
 
 def current_gap():
-    """Délai fixe entre deux requêtes de liste."""
-    return MIN_REQUEST_GAP
+    """Délai entre deux requêtes de liste : jamais plus d'une requête / PER_IP_MIN_GAP par IP active."""
+    if not PROXIES:
+        return max(LIST_INTERVAL, PER_IP_MIN_GAP)
+    now = time.monotonic()
+    active = sum(1 for p in PROXIES if proxy_cooldown.get(("list", p), 0) <= now)
+    return max(LIST_INTERVAL, PER_IP_MIN_GAP / max(1, active))
 
 
 def retry_after(response):
@@ -141,13 +160,23 @@ def retry_after(response):
 
 
 def handle_429(proxy, wait, kind, label=""):
+    """429 : on met cet accès en pause pour cet usage (les autres continuent)."""
     if proxy:
         pause = max(wait, 61)
         proxy_cooldown[(kind, proxy)] = time.monotonic() + pause
-        print(f"429 Roblox{label} via {proxy.split('@')[-1]} : ce proxy est mis en pause {pause}s")
+        print(f"429 Roblox{label} via {proxy.split('@')[-1]} : en pause {pause}s")
     else:
         limiter.penalize(wait)
         print(f"429 Roblox{label} (sans proxy) : pause de {wait}s")
+
+
+def count_bytes(response, raw, proxy):
+    """Estimation (basse) de la bande passante consommée via un proxy : corps + en-têtes."""
+    global proxy_bytes
+    if not proxy or proxy == "direct":
+        return
+    headers_size = sum(len(k) + len(v) + 4 for k, v in response.headers.items())
+    proxy_bytes += len(raw) + headers_size + 500
 
 
 def spawn(coro):
@@ -166,14 +195,11 @@ def normalize(value):
 
 
 def is_limited(item):
-    # Détection élargie pour forcer le rose et le ping Discord même si les tags tardent à arriver
-    if bool(LIMITED_TAGS.intersection(item.get("itemRestrictions") or [])):
+    if LIMITED_TAGS.intersection(item.get("itemRestrictions") or []):
         return True
     if item.get("collectibleItemId"):
         return True
-    if (item.get("totalQuantity") or 0) > 0:
-        return True
-    return False
+    return (item.get("totalQuantity") or 0) > 0
 
 
 def is_on_sale(item):
@@ -208,7 +234,12 @@ def debug_item(item):
 
 
 # ---------------- Requêtes Roblox ----------------
-async def fetch_list(session):
+async def fetch_list(session, limit=None):
+    """Liste ordonnée [(type, id), ...] des derniers items modifiés, ou None en cas d'échec."""
+    params = dict(LIST_PARAMS)
+    if limit:
+        params["Limit"] = limit
+
     for attempt in range(1, RETRIES + 1):
         await limiter.wait()
         proxy = next_proxy("list")
@@ -219,20 +250,23 @@ async def fetch_list(session):
                 await asyncio.sleep(remaining)
         try:
             async with session.get(
-                LIST_URL, params=LIST_PARAMS, headers=HEADERS, proxy=real_proxy(proxy),
+                LIST_URL, params=params, headers=HEADERS, proxy=real_proxy(proxy),
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 if r.status == 429:
                     handle_429(proxy, retry_after(r), "list")
                     continue
-                if r.status == 400 and "IncludeNotForSale" in LIST_PARAMS:
+                if r.status == 400 and "IncludeNotForSale" in params:
                     print("Erreur 400 : on retire IncludeNotForSale de la recherche et on réessaie.")
+                    params.pop("IncludeNotForSale", None)
                     LIST_PARAMS.pop("IncludeNotForSale", None)
                     continue
                 if r.status != 200:
                     print(f"Erreur API Roblox (liste) {r.status} : {(await r.text())[:200]}")
                     return None
-                body = await r.json()
+                raw = await r.read()
+                count_bytes(r, raw, proxy)
+                body = json.loads(raw)
         except Exception as e:
             print(f"Erreur réseau (liste) : {e!r}")
             continue
@@ -243,47 +277,49 @@ async def fetch_list(session):
 
 
 async def fetch_details(session, pairs):
-    global csrf_token
+    """Détails de plusieurs items [(type, id), ...] (POST avec jeton CSRF propre à chaque accès)."""
     if not pairs:
         return []
 
     payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
 
     for attempt in range(1, DETAILS_ATTEMPTS + 1):
-        headers = dict(HEADERS)
-        if csrf_token:
-            headers["x-csrf-token"] = csrf_token
-
         proxy = next_proxy("details")
-        await asyncio.sleep(0.8)  # Sécurité anti-saturation pour les proxys
-
-        try:
-            async with session.post(
-                DETAILS_URL, json=payload, headers=headers, proxy=real_proxy(proxy),
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                if r.status == 403 and r.headers.get("x-csrf-token"):
-                    csrf_token = r.headers["x-csrf-token"]
-                    continue
-                if r.status == 429:
-                    handle_429(proxy, retry_after(r), "details", " (détails)")
-                    await asyncio.sleep(2.0)
-                    continue
-                if r.status != 200:
-                    print(f"Erreur détails {r.status} : {(await r.text())[:200]}")
-                    await asyncio.sleep(1.0)
-                    continue
-                return (await r.json()).get("data", [])
-        except Exception as e:
-            print(f"Erreur réseau (détails) : {e!r}")
-            await asyncio.sleep(1.0)
-            continue
+        label = str(proxy).split("@")[-1]
+        for _ in range(2):  # 2e essai avec le même accès si Roblox renvoie un jeton CSRF
+            headers = dict(HEADERS)
+            if csrf_tokens.get(proxy):
+                headers["x-csrf-token"] = csrf_tokens[proxy]
+            try:
+                async with session.post(
+                    DETAILS_URL, json=payload, headers=headers, proxy=real_proxy(proxy),
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as r:
+                    if r.status == 403 and r.headers.get("x-csrf-token"):
+                        csrf_tokens[proxy] = r.headers["x-csrf-token"]
+                        continue
+                    if r.status == 429:
+                        handle_429(proxy, retry_after(r), "details", " (détails)")
+                        break
+                    if r.status != 200:
+                        print(f"Erreur détails {r.status} via {label} : {(await r.text())[:200]}")
+                        break
+                    raw = await r.read()
+                    count_bytes(r, raw, proxy)
+                    return json.loads(raw).get("data", [])
+            except Exception as e:
+                print(f"Erreur réseau (détails) : {e!r}")
+                break
+        else:
+            print(f"Détails : jeton CSRF refusé via {label}")
+        await asyncio.sleep(0.3)
 
     return []
 
 
 # ---------------- Détection ----------------
 def evaluate(item):
+    """Compare l'item à l'état mémorisé, met à jour la mémoire, et retourne une raison d'alerte (ou None)."""
     key = item_key(item)
     limited = is_limited(item)
     on_sale = is_on_sale(item)
@@ -306,6 +342,7 @@ def evaluate(item):
 
 
 def find_changes(pairs):
+    """Items nouveaux dans la liste, ou remontés vers le haut (= modifiés) depuis le dernier passage."""
     global known_order
     new_order = [i for _, i in pairs]
     if known_order is None:
@@ -318,10 +355,11 @@ def find_changes(pairs):
 
 
 async def seed(session):
+    """Mémorise l'état actuel sans envoyer d'alerte."""
     global known_order
     pairs = None
     for attempt in range(1, 6):
-        pairs = await fetch_list(session)
+        pairs = await fetch_list(session, limit=SEED_LIMIT)
         if pairs:
             break
         print(f"Mémorisation : liste indisponible, nouvel essai ({attempt}/5)")
@@ -331,8 +369,16 @@ async def seed(session):
         print("Mémorisation impossible, la première liste reçue servira de référence.")
         return
 
-    known_order = [i for _, i in pairs]
-    details = await fetch_details(session, pairs + WATCHLIST)
+    known_order = [i for _, i in pairs[:LIST_PARAMS["Limit"]]]
+
+    details = []
+    for attempt in range(1, 4):
+        details = await fetch_details(session, pairs + WATCHLIST)
+        if details:
+            break
+        print(f"Mémorisation : détails indisponibles, nouvel essai ({attempt}/3)")
+        await asyncio.sleep(2)
+
     print("Exemples d'items reçus :")
     for item in details[:5]:
         debug_item(item)
@@ -342,12 +388,13 @@ async def seed(session):
 
 
 async def process_changes(session, pairs):
+    """Récupère les détails, évalue, et envoie les alertes."""
     details = []
     for _ in range(3):
         details = await fetch_details(session, pairs)
         if details:
             break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
     if not details:
         print(f"Détails indisponibles pour {len(pairs)} item(s).")
@@ -392,18 +439,38 @@ async def get_thumbnail(session, item, timeout=2.0):
     else:
         url = "https://thumbnails.roblox.com/v1/assets"
         params = {"assetIds": item["id"], "size": "420x420", "format": "Png"}
+    proxy = next_proxy("thumb")
     try:
         async with session.get(
-            url, params=params, headers=HEADERS, proxy=real_proxy(next_proxy("thumb")),
+            url, params=params, headers=HEADERS, proxy=real_proxy(proxy),
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as r:
             if r.status == 200:
                 data = (await r.json()).get("data", [])
                 if data and data[0].get("imageUrl"):
                     return data[0]["imageUrl"]
-    except Exception:
-        pass
+                state = data[0].get("state") if data else "aucune donnée"
+                print(f"Miniature pas prête pour {item['id']} (état : {state})")
+            elif r.status == 429:
+                handle_429(proxy, retry_after(r), "thumb", " (miniature)")
+            else:
+                print(f"Miniature : erreur HTTP {r.status} pour {item['id']}")
+    except Exception as e:
+        print(f"Miniature : erreur pour {item['id']} : {e!r}")
     return None
+
+
+async def edit_message(session, message_id, embed):
+    try:
+        async with session.patch(
+            f"{WEBHOOK_URL}/messages/{message_id}",
+            json={"embeds": [embed]},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200:
+                print(f"Erreur ajout image ({r.status}) : {(await r.text())[:200]}")
+    except Exception as e:
+        print(f"Erreur ajout image : {e}")
 
 
 async def send_discord_alert(session, item, reason):
@@ -411,6 +478,9 @@ async def send_discord_alert(session, item, reason):
     name = item.get("name", "Unknown item")
     is_bundle = item.get("itemType") == "Bundle"
     item_url = f"https://www.roblox.com/{'bundles' if is_bundle else 'catalog'}/{item_id}"
+
+    # La miniature se récupère en parallèle : on n'attend qu'1 s au maximum avant d'envoyer l'alerte.
+    thumb_task = asyncio.create_task(get_thumbnail(session, item, timeout=4))
 
     titles = {
         "new_limited": ("New Limited", 0xE0457B),
@@ -435,7 +505,8 @@ async def send_discord_alert(session, item, reason):
         normalize(item.get("saleLocationType")), item.get("saleLocationType") or "Unknown"
     )
 
-    thumb = await get_thumbnail(session, item)
+    done, _ = await asyncio.wait({thumb_task}, timeout=1.0)
+    thumb = thumb_task.result() if thumb_task in done else None
 
     embed = {
         "author": {"name": author},
@@ -479,32 +550,39 @@ async def send_discord_alert(session, item, reason):
                     data = await r.json()
                     await asyncio.sleep(float(data.get("retry_after", 1)))
                     continue
+                print(f"Erreur Discord ({r.status}) : {(await r.text())[:200]}")
                 return
-        except Exception:
+        except Exception as e:
+            print(f"Erreur webhook : {e}")
             await asyncio.sleep(1)
     else:
         return
 
     if thumb or not message_id:
         return
+
+    # L'image n'était pas prête à l'envoi : on la rajoute en modifiant le message.
+    thumb = await thumb_task
     for delay in (2, 3, 5, 8):
+        if thumb:
+            break
         await asyncio.sleep(delay)
         thumb = await get_thumbnail(session, item, timeout=5)
-        if thumb:
-            embed["thumbnail"] = {"url": thumb}
-            try:
-                async with session.patch(
-                    f"{WEBHOOK_URL}/messages/{message_id}",
-                    json={"embeds": [embed]},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    pass
-            except Exception:
-                pass
-            return
+
+    if not thumb:
+        # Dernier recours : lien direct d'image Roblox
+        if is_bundle:
+            thumb = f"https://www.roblox.com/bundle-thumbnail/image?bundleId={item_id}&width=420&height=420&format=png"
+        else:
+            thumb = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
+        print(f"Image de secours utilisée pour {name}")
+
+    embed["thumbnail"] = {"url": thumb}
+    await edit_message(session, message_id, embed)
 
 
 def fire_alert(session, item, reason):
+    """Envoie l'alerte en tâche de fond pour ne pas ralentir la détection."""
     spawn(send_discord_alert(session, item, reason))
 
 
@@ -514,14 +592,15 @@ async def main():
     limiter = Limiter(current_gap)
     print(
         f"Bot démarré (1 requête de liste toutes les {current_gap():.2f}s, "
-        f"{len(PROXIES)} proxy(s))."
+        f"{len(PROXIES)} accès pour la liste)."
     )
 
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=40)) as session:
+    connector = aiohttp.TCPConnector(limit=60, keepalive_timeout=120)
+    async with aiohttp.ClientSession(connector=connector) as session:
         await seed(session)
         first_check = True
         next_refresh = time.monotonic() + REFRESH_EVERY_SECONDS
-        next_heartbeat = time.monotonic() + 60
+        next_heartbeat = time.monotonic() + 300
 
         while True:
             pairs = await fetch_list(session)
@@ -546,8 +625,14 @@ async def main():
                 spawn(process_changes(session, pairs[:REFRESH_TOP] + WATCHLIST))
 
             if now >= next_heartbeat:
-                next_heartbeat = now + 60
-                print(f"[{time.strftime('%H:%M:%S')} UTC] actif : {poll_count} listes reçues, {len(tracked_items)} items suivis")
+                next_heartbeat = now + 300
+                hours = max((now - START_TIME) / 3600, 1e-6)
+                mb = proxy_bytes / 1e6
+                print(
+                    f"[{time.strftime('%H:%M:%S')} UTC] actif : {poll_count} listes en 5 min, "
+                    f"{len(tracked_items)} items suivis, proxies ≈ {mb:.1f} Mo depuis le démarrage "
+                    f"(≈ {mb / hours * 24:.0f} Mo/jour, estimation basse)"
+                )
                 poll_count = 0
 
 
