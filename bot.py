@@ -218,6 +218,7 @@ async def main() -> None:
             is_roblox, is_lim = check_item_status(it)
             if is_roblox:
                 state[it["id"]] = {"limited": is_lim}
+                print(f"[cached] {it.get('name')} (ID: {it['id']}) | Limited: {is_lim}")
                 
         print(f"[init] {len(state)} official Roblox accessories cached. Monitoring started.")
 
