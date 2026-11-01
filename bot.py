@@ -1,9 +1,10 @@
 """
-Notifier Roblox Officiel (Limiteds + Items normaux) -> webhook Discord.
+Notifier Roblox Officiel (Limiteds + Items normaux) -> webhook Discord formaté.
 Aucune action sur ton compte : lecture seule de l'API publique du catalogue.
 """
 
 import asyncio
+import functools
 import itertools
 import os
 import time
@@ -14,6 +15,9 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Force l'affichage immédiat des logs sur Render
+print = functools.partial(print, flush=True)
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))  # secondes entre 2 requêtes
@@ -29,16 +33,24 @@ CATALOG_URL = (
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
+SALE_LOCATIONS = {
+    "shoponly": "Website only",
+    "experiencesdevapionly": "Experiences only",
+    "shopandallexperiences": "Website and experiences",
+    "shopandmyexperiences": "Website and creator's experiences",
+}
+
 # id -> {"limited": bool} pour stocker l'état
 state: dict[int, dict] = {}
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
 
 
+def normalize(value):
+    return str(value or "").replace(" ", "").replace("_", "").lower()
+
+
 def check_item_status(item: dict) -> tuple[bool, bool]:
-    """
-    Vérifie si c'est un item officiel Roblox et s'il est limited.
-    Retourne (is_roblox_official, is_limited)
-    """
+    """Vérifie si c'est un item officiel Roblox et s'il est limited."""
     creator_id = item.get("creatorTargetId")
     if creator_id != 1:
         return False, False
@@ -73,11 +85,12 @@ async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | 
 
 async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: bool) -> dict:
     asset_id = item["id"]
+    name = item.get("name", "Unknown")
     price = item.get("price") or item.get("lowestPrice")
     quantity = item.get("totalQuantity")
     left = item.get("unitsAvailableForConsumption")
 
-    price_txt = f"R$ {price:,}" if isinstance(price, int) and price > 0 else "Free"
+    price_txt = f"R${price:,}" if isinstance(price, int) and price > 0 else "Free"
     
     if quantity and quantity > 0:
         qty_txt = f"{left}/{quantity}" if left is not None else str(quantity)
@@ -85,30 +98,39 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
         qty_txt = "Unlimited"
 
     description = (item.get("description") or "").strip() or "—"
+    if len(description) > 300:
+        description = description[:297] + "..."
+
+    location_raw = item.get("saleLocationType") or "Unknown"
+    location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
+
     image_url = await get_thumbnail(session, asset_id)
 
-    # Configuration selon si c'est un Limited ou un item normal Roblox
+    # Style et rôles selon le type d'item
     if is_limited:
-        author_name = "Went Limited"
-        color = 0xE6A8F0  # Rose
+        author_name = "New Limited"
+        color = 0xE0457B  # Rose vif
         content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
     else:
         author_name = "New Roblox Item"
-        color = 0x3498DB  # Bleu (pas rose, pas de ping)
+        color = 0x3498DB  # Bleu pour les items normaux
         content = None
 
     embed = {
-        "title": item.get("name", "Unknown"),
+        "author": {"name": author_name},
+        "title": name,
         "url": f"https://www.roblox.com/catalog/{asset_id}",
         "color": color,
-        "author": {"name": author_name},
-        "description": f"**Description:**\n{description[:900]}",
+        "description": (
+            f"**Asset ID:** {asset_id}\n\n"
+            f"**Description:**\n{description}\n\n"
+            f"**Purchase location:**\n{location}"
+        ),
         "fields": [
-            {"name": "Asset ID", "value": f"`{asset_id}`", "inline": True},
-            {"name": "Prix", "value": price_txt, "inline": True},
-            {"name": "Quantité", "value": qty_txt, "inline": True},
+            {"name": "Price", "value": price_txt, "inline": True},
+            {"name": "Quantity", "value": qty_txt, "inline": True},
         ],
-        "footer": {"text": "Detected at"},
+        "footer": {"text": "Detected at:"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -156,8 +178,7 @@ async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
 
 
 async def start_health_server() -> None:
-    """Mini serveur HTTP pour Render (Web Service) et pour les pings keep-alive."""
-
+    """Mini serveur HTTP pour Render (Web Service)."""
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
@@ -216,12 +237,10 @@ async def main() -> None:
                     previous = state.get(item_id)
                     
                     if previous is None:
-                        # Nouvel item officiel Roblox découvert
                         state[item_id] = {"limited": is_lim}
                         print(f"[nouveau Roblox] {it.get('name')} ({item_id}) | Limited: {is_lim}")
                         asyncio.create_task(process_item_notification(session, it, is_lim))
                     else:
-                        # Si l'item devient limited alors qu'il ne l'était pas
                         if is_lim and not previous["limited"]:
                             state[item_id]["limited"] = True
                             print(f"[Went Limited] {it.get('name')} ({item_id})")
