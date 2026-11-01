@@ -22,32 +22,20 @@ print = functools.partial(print, flush=True)
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))  # seconds between requests
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # @limited role ID (optional)
-CATEGORY = os.getenv("CATALOG_CATEGORY", "1")  # adjust if needed
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
-# URL filtered specifically for official Roblox creator (CreatorTargetId=1)
+# URL filtered specifically for official Roblox creator (CreatorTargetId=1) 
+# and strictly on Accessories (Category=11) to avoid faces, heads, and makeup.
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
-    f"?Category={CATEGORY}&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
+    "?Category=11&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
-
-SALE_LOCATIONS = {
-    "shoponly": "Website only",
-    "experiencesdevapionly": "Experiences only",
-    "shopandallexperiences": "Website and experiences",
-    "shopandmyexperiences": "Website and creator's experiences",
-    "shopandexperiencesbyid": "Website and specific experiences",
-}
 
 # id -> {"limited": bool} to store state
 state: dict[int, dict] = {}
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
-
-
-def normalize(value):
-    return str(value or "").replace(" ", "").replace("_", "").lower()
 
 
 def check_item_status(item: dict) -> tuple[bool, bool]:
@@ -91,50 +79,42 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
     quantity = item.get("totalQuantity")
     left = item.get("unitsAvailableForConsumption")
 
-    price_txt = f"R${price:,}" if isinstance(price, int) and price > 0 else "Free"
+    price_txt = f"{price:,} Robux" if isinstance(price, int) and price > 0 else "Free"
     
-    if quantity and quantity > 0:
-        qty_txt = f"{left}/{quantity}" if left is not None else str(quantity)
-    else:
-        qty_txt = "Unlimited"
-
-    description = (item.get("description") or "").strip() or "—"
-    if len(description) > 300:
-        description = description[:297] + "..."
-
-    location_raw = item.get("saleLocationType") or "Unknown"
-    location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
-
-    image_url = await get_thumbnail(session, asset_id)
-
     if is_limited:
-        author_name = "New Limited"
+        stock_txt = f"📦 Stock: {left}/{quantity}" if left is not None and quantity else (f"📦 Stock: {quantity}" if quantity else "📦 Stock: Limited")
+        status_line = f"New Roblox Limited Item {stock_txt}"
         color = 0xE0457B  # Vibrant pink
         content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
     else:
-        author_name = "New Roblox Item"
+        stock_txt = f"📦 Stock: {quantity}" if quantity and quantity > 0 else "📦 Stock: Unlimited"
+        status_line = f"New Roblox Item {stock_txt}"
         color = 0x3498DB  # Blue
         content = None
 
-    # Invisible characters padding to force rectangular embed width on Discord
-    width_pad = "\u2800" * 45
+    image_url = await get_thumbnail(session, asset_id)
 
     embed = {
-        "author": {"name": author_name},
         "title": name,
         "url": f"https://www.roblox.com/catalog/{asset_id}",
         "color": color,
         "description": (
-            f"**Asset ID:** {asset_id}\n\n"
-            f"**Description:**\n{description}\n\n"
-            f"**Purchase location:**\n{location}\n\n"
-            f"{width_pad}"
+            f"{status_line}\n"
+            f"🌐 [Roblox Page](https://www.roblox.com/catalog/{asset_id})"
         ),
         "fields": [
-            {"name": "Price", "value": price_txt, "inline": True},
-            {"name": "Quantity", "value": qty_txt, "inline": True},
+            {
+                "name": "Creator",
+                "value": "Roblox",
+                "inline": False
+            },
+            {
+                "name": "💰 Price",
+                "value": price_txt,
+                "inline": False
+            }
         ],
-        "footer": {"text": "Detected at:"},
+        "footer": {"text": "Roblox Catalog Notifier"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -220,7 +200,7 @@ async def main() -> None:
             if is_roblox:
                 state[it["id"]] = {"limited": is_lim}
                 
-        print(f"[init] {len(state)} official Roblox items cached. Monitoring started.")
+        print(f"[init] {len(state)} official Roblox accessories cached. Monitoring started.")
 
         if TEST_ON_START and items:
             print("[test] Sending startup test alert...")
@@ -242,7 +222,7 @@ async def main() -> None:
                     
                     if previous is None:
                         state[item_id] = {"limited": is_lim}
-                        print(f"[new roblox item] {it.get('name')} ({item_id}) | Limited: {is_lim}")
+                        print(f"[new accessory] {it.get('name')} ({item_id}) | Limited: {is_lim}")
                         asyncio.create_task(process_item_notification(session, it, is_lim))
                     else:
                         if is_lim and not previous["limited"]:
