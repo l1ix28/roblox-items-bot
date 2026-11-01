@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -114,7 +115,24 @@ async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
         return None
 
 
+async def start_health_server() -> None:
+    """Mini serveur HTTP pour Render (Web Service) et pour les pings keep-alive."""
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"[http] serveur de santé sur le port {port}")
+
+
 async def main() -> None:
+    await start_health_server()
     timeout = aiohttp.ClientTimeout(total=8)
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
     async with aiohttp.ClientSession(
