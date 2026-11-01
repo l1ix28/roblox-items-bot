@@ -39,41 +39,37 @@ if not WEBHOOK_URL:
     raise SystemExit(1)
 
 # ---------------- Réglages ----------------
-# La route qui liste les derniers items autorise 12 requêtes par minute et par IP
-# (en-tête x-ratelimit-limit: 12;w=60), donc 1 requête toutes les 5 s par IP.
-# Ce délai est divisé par le nombre de proxies actifs : 10 proxies = 1 requête toutes les ~0,55 s.
-# Monte cette valeur si tu veux consommer moins de bande passante (ex : 20 = 1 requête / 2 s avec 10 proxies).
-MIN_REQUEST_GAP = float(os.environ.get("MIN_REQUEST_GAP", 5.5))
-# Proxies (séparés par des virgules), ex : "http://user:pass@ip:port,http://user:pass@ip:port"
-# Tu peux mettre "direct" dans la liste : ça veut dire "sans proxy" (IP de Render, gratuit en bande passante).
-# Exemple sans aucun proxy payant : PROXIES=direct
+# Délai fixé directement à 6.30 secondes pour chaque proxy
+MIN_REQUEST_GAP = 6.30
+
+# Proxies (séparés par des virgules)
 PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
-# ID du rôle Discord à ping pour les limiteds (clic droit sur le rôle > Copier l'identifiant)
+
+# ID du rôle Discord à ping pour les limiteds
 LIMITED_ROLE_ID = os.environ.get("LIMITED_ROLE_ID")
 
-REFRESH_EVERY_SECONDS = 8      # on revérifie les détails des tout derniers items (pour voir un item passer limited)
+REFRESH_EVERY_SECONDS = 8      # on revérifie les détails des tout derniers items
 REFRESH_TOP = 5                # nombre d'items du haut de la liste revérifiés
 NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = True   # alerter aussi sur les nouveaux items Roblox non limited
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
-INCLUDE_OFFSALE = True         # inclut les items hors vente (désactivé tout seul si Roblox répond 400)
+INCLUDE_OFFSALE = True         # inclut les items hors vente
 TEST_ON_START = os.environ.get("TEST_ON_START") == "1"
 RETRIES = 3
 DETAILS_ATTEMPTS = 6
 
-# Items surveillés en plus, même s'ils ne sont pas modifiés récemment.
-# ("Bundle", id) pour roblox.com/bundles/ID/...    ("Asset", id) pour roblox.com/catalog/ID/...
+# Items surveillés en plus
 WATCHLIST = [
     ("Bundle", 319226),  # Korblox Deathwalker
 ]
 
-LIST_URL = "https://catalog.roblox.com/v1/search/items"                # liste d'IDs (rapide)
-DETAILS_URL = "https://catalog.roblox.com/v1/catalog/items/details"    # détails (POST)
+LIST_URL = "https://catalog.roblox.com/v1/search/items"
+DETAILS_URL = "https://catalog.roblox.com/v1/catalog/items/details"
 LIST_PARAMS = {
     "Category": 1,
     "CreatorTargetId": 1,
     "CreatorType": "User",
-    "SortType": 3,        # 3 = Updated (les plus récemment modifiés d'abord)
+    "SortType": 3,
     "Limit": 10,
 }
 if INCLUDE_OFFSALE:
@@ -83,7 +79,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/3.0)"}
 LIMITED_TAGS = {"Collectible", "Limited", "LimitedUnique"}
 
 tracked_items = {}      # "Type:id" -> {"limited": bool, "on_sale": bool}
-known_order = None      # derniers IDs vus dans la liste, du plus récent au plus ancien
+known_order = None      # derniers IDs vus dans la liste
 csrf_token = None
 limiter = None
 background_tasks = set()
@@ -94,7 +90,7 @@ poll_count = 0
 
 # ---------------- Limiteur de requêtes ----------------
 class Limiter:
-    """Espace les requêtes de la liste, et gère les pauses quand on n'utilise pas de proxy."""
+    """Espace les requêtes de la liste."""
 
     def __init__(self, gap_func):
         self.gap_func = gap_func
@@ -116,12 +112,10 @@ class Limiter:
 
 
 def real_proxy(entry):
-    """"direct" dans PROXIES = pas de proxy (on utilise l'IP de Render, sans consommer de bande passante Webshare)."""
     return None if entry == "direct" else entry
 
 
 def next_proxy(kind="list"):
-    """Prochain proxy pour cet usage ("list", "details" ou "thumb") qui n'est pas en pause."""
     if not PROXIES:
         return None
     if kind not in proxy_cycles:
@@ -135,12 +129,8 @@ def next_proxy(kind="list"):
 
 
 def current_gap():
-    """Délai entre deux requêtes de liste : divisé par le nombre de proxies actifs."""
-    if not PROXIES:
-        return MIN_REQUEST_GAP
-    now = time.monotonic()
-    active = sum(1 for p in PROXIES if proxy_cooldown.get(("list", p), 0) <= now)
-    return MIN_REQUEST_GAP / max(1, active)
+    """Délai fixe entre deux requêtes de liste."""
+    return MIN_REQUEST_GAP
 
 
 def retry_after(response):
@@ -151,7 +141,6 @@ def retry_after(response):
 
 
 def handle_429(proxy, wait, kind, label=""):
-    """429 : on met ce proxy en pause pour cet usage (les autres continuent)."""
     if proxy:
         pause = max(wait, 61)
         proxy_cooldown[(kind, proxy)] = time.monotonic() + pause
@@ -177,13 +166,11 @@ def normalize(value):
 
 
 def is_limited(item):
-    # 1. Vérifie les tags classiques de restrictions
+    # Détection élargie pour forcer le rose et le ping Discord même si les tags tardent à arriver
     if bool(LIMITED_TAGS.intersection(item.get("itemRestrictions") or [])):
         return True
-    # 2. Vérifie si l'item possède un ID collectible Roblox
     if item.get("collectibleItemId"):
         return True
-    # 3. Vérifie si l'item a explicitement un stock limité supérieur à 0 (ex: 0/13)
     if (item.get("totalQuantity") or 0) > 0:
         return True
     return False
@@ -222,14 +209,12 @@ def debug_item(item):
 
 # ---------------- Requêtes Roblox ----------------
 async def fetch_list(session):
-    """Liste ordonnée [(type, id), ...] des derniers items modifiés, ou None en cas d'échec."""
     for attempt in range(1, RETRIES + 1):
         await limiter.wait()
         proxy = next_proxy("list")
         if proxy:
             remaining = proxy_cooldown.get(("list", proxy), 0) - time.monotonic()
             if remaining > 0:
-                # tous les accès sont en pause après des 429 : inutile d'insister, on attend la fin de la pause
                 print(f"Tous les accès sont en pause, reprise dans {remaining:.0f}s")
                 await asyncio.sleep(remaining)
         try:
@@ -258,7 +243,6 @@ async def fetch_list(session):
 
 
 async def fetch_details(session, pairs):
-    """Détails de plusieurs items [(type, id), ...] (requête POST, avec jeton CSRF)."""
     global csrf_token
     if not pairs:
         return []
@@ -271,6 +255,8 @@ async def fetch_details(session, pairs):
             headers["x-csrf-token"] = csrf_token
 
         proxy = next_proxy("details")
+        await asyncio.sleep(0.8)  # Sécurité anti-saturation pour les proxys
+
         try:
             async with session.post(
                 DETAILS_URL, json=payload, headers=headers, proxy=real_proxy(proxy),
@@ -281,16 +267,16 @@ async def fetch_details(session, pairs):
                     continue
                 if r.status == 429:
                     handle_429(proxy, retry_after(r), "details", " (détails)")
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(2.0)
                     continue
                 if r.status != 200:
                     print(f"Erreur détails {r.status} : {(await r.text())[:200]}")
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(1.0)
                     continue
                 return (await r.json()).get("data", [])
         except Exception as e:
             print(f"Erreur réseau (détails) : {e!r}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.0)
             continue
 
     return []
@@ -298,7 +284,6 @@ async def fetch_details(session, pairs):
 
 # ---------------- Détection ----------------
 def evaluate(item):
-    """Compare l'item à l'état mémorisé, met à jour la mémoire, et retourne une raison d'alerte (ou None)."""
     key = item_key(item)
     limited = is_limited(item)
     on_sale = is_on_sale(item)
@@ -321,7 +306,6 @@ def evaluate(item):
 
 
 def find_changes(pairs):
-    """Items nouveaux dans la liste, ou remontés vers le haut (= modifiés) depuis le dernier passage."""
     global known_order
     new_order = [i for _, i in pairs]
     if known_order is None:
@@ -334,7 +318,6 @@ def find_changes(pairs):
 
 
 async def seed(session):
-    """Mémorise l'état actuel sans envoyer d'alerte."""
     global known_order
     pairs = None
     for attempt in range(1, 6):
@@ -349,7 +332,7 @@ async def seed(session):
         return
 
     known_order = [i for _, i in pairs]
-    details = await fetch_details(session, pairs + WATCHLIST)   # tous les items de la liste, pour éviter les fausses alertes
+    details = await fetch_details(session, pairs + WATCHLIST)
     print("Exemples d'items reçus :")
     for item in details[:5]:
         debug_item(item)
@@ -359,7 +342,6 @@ async def seed(session):
 
 
 async def process_changes(session, pairs):
-    """Récupère les détails, évalue, et envoie les alertes."""
     details = []
     for _ in range(3):
         details = await fetch_details(session, pairs)
@@ -419,12 +401,8 @@ async def get_thumbnail(session, item, timeout=2.0):
                 data = (await r.json()).get("data", [])
                 if data and data[0].get("imageUrl"):
                     return data[0]["imageUrl"]
-                state = data[0].get("state") if data else "aucune donnée"
-                print(f"Miniature pas prête pour {item['id']} (état : {state})")
-            else:
-                print(f"Miniature : erreur HTTP {r.status} pour {item['id']}")
-    except Exception as e:
-        print(f"Miniature : erreur pour {item['id']} : {e!r}")
+    except Exception:
+        pass
     return None
 
 
@@ -501,16 +479,12 @@ async def send_discord_alert(session, item, reason):
                     data = await r.json()
                     await asyncio.sleep(float(data.get("retry_after", 1)))
                     continue
-                print(f"Erreur Discord ({r.status}) : {(await r.text())[:200]}")
                 return
-        except Exception as e:
-            print(f"Erreur webhook : {e}")
+        except Exception:
             await asyncio.sleep(1)
     else:
         return
 
-    # Si l'image n'était pas prête à l'envoi, on réessaie quelques secondes
-    # puis on modifie le message pour l'ajouter.
     if thumb or not message_id:
         return
     for delay in (2, 3, 5, 8):
@@ -524,31 +498,13 @@ async def send_discord_alert(session, item, reason):
                     json={"embeds": [embed]},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as r:
-                    if r.status != 200:
-                        print(f"Erreur ajout image ({r.status}) : {(await r.text())[:200]}")
-            except Exception as e:
-                print(f"Erreur ajout image : {e}")
+                    pass
+            except Exception:
+                pass
             return
-
-    # Dernier recours : lien direct d'image Roblox (redirige vers l'image quand elle existe)
-    if is_bundle:
-        fallback = f"https://www.roblox.com/bundle-thumbnail/image?bundleId={item_id}&width=420&height=420&format=png"
-    else:
-        fallback = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
-    embed["thumbnail"] = {"url": fallback}
-    try:
-        async with session.patch(
-            f"{WEBHOOK_URL}/messages/{message_id}",
-            json={"embeds": [embed]},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            print(f"Image de secours ajoutée pour {name} (HTTP {r.status})")
-    except Exception as e:
-        print(f"Erreur image de secours : {e}")
 
 
 def fire_alert(session, item, reason):
-    """Envoie l'alerte en tâche de fond pour ne pas ralentir la détection."""
     spawn(send_discord_alert(session, item, reason))
 
 
