@@ -33,9 +33,21 @@ CATALOG_URL = (
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
+SALE_LOCATIONS = {
+    "shoponly": "Website only",
+    "experiencesdevapionly": "Experiences only",
+    "shopandallexperiences": "Website and experiences",
+    "shopandmyexperiences": "Website and creator's experiences",
+    "shopandexperiencesbyid": "Website and specific experiences",
+}
+
 # id -> {"limited": bool} to store state
 state: dict[int, dict] = {}
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+
+
+def normalize(value):
+    return str(value or "").replace(" ", "").replace("_", "").lower()
 
 
 def check_item_status(item: dict) -> tuple[bool, bool]:
@@ -79,42 +91,50 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
     quantity = item.get("totalQuantity")
     left = item.get("unitsAvailableForConsumption")
 
-    price_txt = f"{price:,} Robux" if isinstance(price, int) and price > 0 else "Free"
+    price_txt = f"R${price:,}" if isinstance(price, int) and price > 0 else "Free"
     
-    if is_limited:
-        stock_txt = f"📦 Stock: {left}/{quantity}" if left is not None and quantity else (f"📦 Stock: {quantity}" if quantity else "📦 Stock: Limited")
-        status_line = f"New Roblox Limited Item {stock_txt}"
-        color = 0xE0457B  # Vibrant pink
-        content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
+    if quantity and quantity > 0:
+        qty_txt = f"{left}/{quantity}" if left is not None else str(quantity)
     else:
-        stock_txt = f"📦 Stock: {quantity}" if quantity and quantity > 0 else "📦 Stock: Unlimited"
-        status_line = f"New Roblox Item {stock_txt}"
-        color = 0x3498DB  # Blue
-        content = None
+        qty_txt = "Unlimited"
+
+    description = (item.get("description") or "").strip() or "—"
+    if len(description) > 300:
+        description = description[:297] + "..."
+
+    location_raw = item.get("saleLocationType") or "Unknown"
+    location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
 
     image_url = await get_thumbnail(session, asset_id)
 
+    if is_limited:
+        author_name = "New Limited"
+        color = 0xE0457B  # Vibrant pink
+        content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
+    else:
+        author_name = "New Roblox Item"
+        color = 0x3498DB  # Blue
+        content = None
+
+    # Invisible characters padding to force rectangular embed width on Discord
+    width_pad = "\u2800" * 45
+
     embed = {
+        "author": {"name": author_name},
         "title": name,
         "url": f"https://www.roblox.com/catalog/{asset_id}",
         "color": color,
         "description": (
-            f"{status_line}\n"
-            f"🌐 [Roblox Page](https://www.roblox.com/catalog/{asset_id})"
+            f"**Asset ID:** {asset_id}\n\n"
+            f"**Description:**\n{description}\n\n"
+            f"**Purchase location:**\n{location}\n\n"
+            f"{width_pad}"
         ),
         "fields": [
-            {
-                "name": "Creator",
-                "value": "Roblox",
-                "inline": False
-            },
-            {
-                "name": "💰 Price",
-                "value": price_txt,
-                "inline": False
-            }
+            {"name": "Price", "value": price_txt, "inline": True},
+            {"name": "Quantity", "value": qty_txt, "inline": True},
         ],
-        "footer": {"text": "Roblox Catalog Notifier"},
+        "footer": {"text": "Detected at:"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
