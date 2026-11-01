@@ -1,5 +1,5 @@
 """
-Notifier Roblox "Went Limited" -> webhook Discord.
+Notifier Roblox "Went Limited" (Créations officielles Roblox uniquement) -> webhook Discord.
 Aucune action sur ton compte : lecture seule de l'API publique du catalogue.
 """
 
@@ -20,11 +20,12 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))  # secondes entre 2 req
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # ID du rôle @limited (optionnel)
 CATEGORY = os.getenv("CATALOG_CATEGORY", "1")  # à ajuster si besoin
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
-TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"  # Activé via ta variable sur Render
+TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
+# URL filtrée spécifiquement sur le créateur officiel Roblox (CreatorTargetId=1)
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
-    f"?Category={CATEGORY}&SortType=3&Limit=30"
+    f"?Category={CATEGORY}&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
@@ -34,10 +35,14 @@ proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
 
 
 def is_limited(item: dict) -> bool:
+    # Double vérification : créateur officiel Roblox obligatoire (ID 1)
+    creator_id = item.get("creatorTargetId")
+    if creator_id != 1:
+        return False
+
     restrictions = item.get("itemRestrictions") or []
     return bool(
-        item.get("collectibleItemId")
-        or "Limited" in restrictions
+        "Limited" in restrictions
         or "LimitedUnique" in restrictions
         or "Collectible" in restrictions
     )
@@ -147,9 +152,8 @@ async def main() -> None:
                 await asyncio.sleep(2)
         for it in items:
             state[it["id"]] = is_limited(it)
-        print(f"[init] {len(state)} items en cache. Surveillance lancée.")
+        print(f"[init] {len(state)} items officiels Roblox en cache. Surveillance lancée.")
 
-        # Test au démarrage si activé via la variable Render
         if TEST_ON_START and items:
             print("[test] Envoi d'une alerte de test au démarrage...")
             asyncio.create_task(send_webhook(session, build_payload(items[0])))
@@ -163,7 +167,7 @@ async def main() -> None:
                     was_limited = state.get(it["id"])  # None = jamais vu
                     state[it["id"]] = now_limited
                     if now_limited and not was_limited:
-                        print(f"[limited] {it.get('name')} ({it['id']})")
+                        print(f"[limited officiel] {it.get('name')} ({it['id']})")
                         asyncio.create_task(send_webhook(session, build_payload(it)))
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
