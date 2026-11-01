@@ -25,11 +25,10 @@ PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # @limited role ID (optional)
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
-# URL filtered specifically for official Roblox creator (CreatorTargetId=1) 
-# and strictly on Accessories (Category=11) to avoid faces, heads, and makeup.
+# URL filtered for official Roblox creator (CreatorTargetId=1), Accessories (Category=11), Limit=10
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
-    "?Category=11&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
+    "?Category=11&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=10"
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
