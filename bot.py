@@ -74,7 +74,7 @@ LIST_PARAMS = {
     "CreatorTargetId": 1,
     "CreatorType": "User",
     "SortType": 3,        # 3 = Updated (les plus récemment modifiés d'abord)
-    "Limit": 30,
+    "Limit": 10,
 }
 if INCLUDE_OFFSALE:
     LIST_PARAMS["IncludeNotForSale"] = "true"
