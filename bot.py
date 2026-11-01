@@ -41,12 +41,16 @@ if not WEBHOOK_URL:
 # ---------------- Réglages ----------------
 # Délai (secondes) entre deux requêtes de liste, toutes IP confondues.
 # Plus c'est bas, plus tu détectes vite, mais plus tu consommes de bande passante proxy.
-LIST_INTERVAL = float(os.environ.get("LIST_INTERVAL", 6.3))
+LIST_INTERVAL = float(os.environ.get("LIST_INTERVAL", 5.2))
 # Roblox autorise 12 requêtes/minute/IP sur la liste : on ne dépasse jamais 1 requête / 5.2 s par IP.
 PER_IP_MIN_GAP = float(os.environ.get("PER_IP_MIN_GAP", 5.2))
 
 # Proxies utilisés pour la LISTE (séparés par des virgules). Mets "direct" pour utiliser l'IP de Render.
-PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
+_proxies_env = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
+# Mode sans proxy par défaut (gratuit) : les proxies ne sont utilisés que si USE_PROXIES=1.
+PROXIES = _proxies_env if os.environ.get("USE_PROXIES") == "1" else []
+if _proxies_env and not PROXIES:
+    print("PROXIES ignorés (mode sans proxy). Mets USE_PROXIES=1 pour les utiliser.")
 
 # ID du rôle Discord à ping pour les limiteds
 LIMITED_ROLE_ID = os.environ.get("LIMITED_ROLE_ID")
@@ -159,15 +163,23 @@ def retry_after(response):
         return 5
 
 
+def reset_after(response):
+    """Secondes avant que Roblox réinitialise la limite (en-tête x-ratelimit-reset), 60 par défaut."""
+    try:
+        return int(response.headers.get("x-ratelimit-reset", 60))
+    except ValueError:
+        return 60
+
+
 def handle_429(proxy, wait, kind, label=""):
     """429 : on met cet accès en pause pour cet usage (les autres continuent)."""
     if proxy:
-        pause = max(wait, 61)
+        pause = min(61, wait + 1)
         proxy_cooldown[(kind, proxy)] = time.monotonic() + pause
         print(f"429 Roblox{label} via {proxy.split('@')[-1]} : en pause {pause}s")
     else:
-        limiter.penalize(wait)
-        print(f"429 Roblox{label} (sans proxy) : pause de {wait}s")
+        limiter.penalize(wait + 1)
+        print(f"429 Roblox{label} (sans proxy) : pause de {wait + 1}s")
 
 
 def count_bytes(response, raw, proxy):
@@ -254,7 +266,7 @@ async def fetch_list(session, limit=None):
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 if r.status == 429:
-                    handle_429(proxy, retry_after(r), "list")
+                    handle_429(proxy, reset_after(r), "list")
                     continue
                 if r.status == 400 and "IncludeNotForSale" in params:
                     print("Erreur 400 : on retire IncludeNotForSale de la recherche et on réessaie.")
@@ -276,14 +288,17 @@ async def fetch_list(session, limit=None):
     return None
 
 
-async def fetch_details(session, pairs):
+async def fetch_details(session, pairs, urgent=True):
     """Détails de plusieurs items [(type, id), ...] (POST avec jeton CSRF propre à chaque accès)."""
     if not pairs:
+        return []
+    # revérification de routine : si Roblox nous limite déjà, on saute (les vrais nouveaux items ont la priorité)
+    if not urgent and not PROXIES and proxy_cooldown.get(("details", "direct"), 0) > time.monotonic():
         return []
 
     payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
 
-    for attempt in range(1, DETAILS_ATTEMPTS + 1):
+    for attempt in range(1, (DETAILS_ATTEMPTS if urgent else 1) + 1):
         proxy = next_proxy("details")
         label = str(proxy).split("@")[-1]
         for _ in range(2):  # 2e essai avec le même accès si Roblox renvoie un jeton CSRF
@@ -299,7 +314,10 @@ async def fetch_details(session, pairs):
                         csrf_tokens[proxy] = r.headers["x-csrf-token"]
                         continue
                     if r.status == 429:
-                        handle_429(proxy, retry_after(r), "details", " (détails)")
+                        handle_429(proxy, reset_after(r), "details", " (détails)")
+                        if urgent and not PROXIES:
+                            # pas d'autre accès possible : on attend la fin de la limite puis on réessaie
+                            await asyncio.sleep(min(reset_after(r), 15))
                         break
                     if r.status != 200:
                         print(f"Erreur détails {r.status} via {label} : {(await r.text())[:200]}")
@@ -387,17 +405,18 @@ async def seed(session):
     print(f"Démarrage : {len(pairs)} items dans la liste, {len(details)} mémorisés, sans alerte.")
 
 
-async def process_changes(session, pairs):
+async def process_changes(session, pairs, urgent=True):
     """Récupère les détails, évalue, et envoie les alertes."""
     details = []
-    for _ in range(3):
-        details = await fetch_details(session, pairs)
+    for _ in range(3 if urgent else 1):
+        details = await fetch_details(session, pairs, urgent)
         if details:
             break
         await asyncio.sleep(0.5)
 
     if not details:
-        print(f"Détails indisponibles pour {len(pairs)} item(s).")
+        if urgent:
+            print(f"Détails indisponibles pour {len(pairs)} item(s).")
         return
 
     alerts = []
@@ -419,7 +438,8 @@ async def process_changes(session, pairs):
 async def send_test_alert(session, pairs):
     details = await fetch_details(session, pairs[:1])
     if details:
-        fire_alert(session, details[0], "new_item")
+        # l'alerte test est envoyée comme une vraie limited (rose + ping) pour vérifier la couleur et le rôle
+        fire_alert(session, details[0], "new_limited")
         print("Alerte test envoyée.")
 
 
@@ -452,7 +472,7 @@ async def get_thumbnail(session, item, timeout=2.0):
                 state = data[0].get("state") if data else "aucune donnée"
                 print(f"Miniature pas prête pour {item['id']} (état : {state})")
             elif r.status == 429:
-                handle_429(proxy, retry_after(r), "thumb", " (miniature)")
+                handle_429(proxy, reset_after(r), "thumb", " (miniature)")
             else:
                 print(f"Miniature : erreur HTTP {r.status} pour {item['id']}")
     except Exception as e:
@@ -622,7 +642,7 @@ async def main():
             now = time.monotonic()
             if now >= next_refresh:
                 next_refresh = now + REFRESH_EVERY_SECONDS
-                spawn(process_changes(session, pairs[:REFRESH_TOP] + WATCHLIST))
+                spawn(process_changes(session, pairs[:REFRESH_TOP] + WATCHLIST, False))
 
             if now >= next_heartbeat:
                 next_heartbeat = now + 300
