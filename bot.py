@@ -39,9 +39,10 @@ if not WEBHOOK_URL:
     raise SystemExit(1)
 
 # ---------------- Réglages ----------------
-# Délai minimum entre deux requêtes vers Roblox (secondes).
-# Commence à 2. Si tu vois des "429" dans les logs, monte à 3 ou 4.
-MIN_REQUEST_GAP = float(os.environ.get("MIN_REQUEST_GAP", 2))
+# Délai minimum entre deux requêtes vers Roblox (secondes), PAR IP.
+# Cette route de Roblox autorise 1 requête par 60 s et par IP (en-tête x-ratelimit-limit: 1;w=60).
+# Le bot divise ce délai par le nombre de proxies : 4 proxies = 1 requête toutes les ~15 s.
+MIN_REQUEST_GAP = float(os.environ.get("MIN_REQUEST_GAP", 61))
 # Proxies optionnels (séparés par des virgules), ex : "http://user:pass@ip:port,http://..."
 # Avec N proxies, le délai effectif entre requêtes est divisé par N (donc détection plus rapide).
 PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
@@ -49,7 +50,7 @@ PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.stri
 LIMITED_ROLE_ID = os.environ.get("LIMITED_ROLE_ID")
 
 WATCHLIST_EVERY = 5            # la watchlist est vérifiée 1 tour sur 5
-SEED_PAGES = 4                 # pages mémorisées au démarrage (30 items par page)
+SEED_PAGES = 1                 # pages mémorisées au démarrage (30 items par page)
 NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
 ALERT_NEW_NON_LIMITED = True   # alerter aussi sur les nouveaux items Roblox non limited
 ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
@@ -125,7 +126,7 @@ def next_proxy():
 def handle_429(proxy, wait, label=""):
     """429 : on met ce proxy en pause (les autres continuent). Sans proxy, on met tout en pause."""
     if proxy:
-        pause = max(wait, 30)
+        pause = max(wait, 61)
         proxy_cooldown[proxy] = time.monotonic() + pause
         print(f"429 Roblox{label} via {proxy.split('@')[-1]} : ce proxy est mis en pause {pause}s")
     else:
