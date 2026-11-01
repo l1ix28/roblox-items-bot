@@ -1,10 +1,14 @@
 import os
 import json
 import time
-import requests
+import asyncio
+import itertools
 from datetime import datetime, timedelta, timezone
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import aiohttp
+
 
 # --- Mini serveur HTTP pour satisfaire Render (Web Service) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -12,19 +16,17 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
-    
+
     def log_message(self, format, *args):
-        # Désactive les logs HTTP polluants dans la console
         return
+
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
-# Lance le serveur web en arrière-plan (thread daemon)
-server_thread = Thread(target=run_server, daemon=True)
-server_thread.start()
+
+Thread(target=run_server, daemon=True).start()
 print("Mini serveur HTTP démarré pour Render.")
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
@@ -33,19 +35,24 @@ if not WEBHOOK_URL:
     raise SystemExit(1)
 
 # ---------------- Réglages ----------------
-MIN_REQUEST_GAP = 45           # secondes minimum entre deux requêtes vers le catalogue Roblox
-WATCHLIST_EVERY = 3            # la watchlist est vérifiée 1 tour sur 3 (1 = à chaque tour)
-SEED_PAGES = 4                 # pages d'items mémorisées au démarrage (30 items par page)
-NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
-ALERT_NEW_NON_LIMITED = True   # True = alerter aussi sur les nouveaux items Roblox non limited
-ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
-INCLUDE_OFFSALE = True         # inclut les items hors vente dans la recherche (mets False si l'API renvoie une erreur 400)
-TEST_ON_START = os.environ.get("TEST_ON_START") == "1"  # TEST_ON_START=1 envoie une alerte test au démarrage
-INTERVAL = 5                   # pause supplémentaire entre deux tours (le délai de 20s entre requêtes s'applique déjà)
-RETRIES = 2                    # essais par requête en cas de 429
+# Délai minimum entre deux requêtes vers Roblox (secondes).
+# Commence à 2. Si tu vois des "429" dans les logs, monte à 3 ou 4.
+MIN_REQUEST_GAP = float(os.environ.get("MIN_REQUEST_GAP", 2))
+# Proxies optionnels (séparés par des virgules), ex : "http://user:pass@ip:port,http://..."
+# Avec N proxies, le délai effectif entre requêtes est divisé par N (donc détection plus rapide).
+PROXIES = [p.strip() for p in os.environ.get("PROXIES", "").split(",") if p.strip()]
+# ID du rôle Discord à ping pour les limiteds (clic droit sur le rôle > Copier l'identifiant)
+LIMITED_ROLE_ID = os.environ.get("LIMITED_ROLE_ID")
 
-# Items surveillés en plus, même s'ils ne sont pas modifiés récemment.
-# ("Bundle", id) pour un lien roblox.com/bundles/ID/...    ("Asset", id) pour un lien roblox.com/catalog/ID/...
+WATCHLIST_EVERY = 5            # la watchlist est vérifiée 1 tour sur 5
+SEED_PAGES = 4                 # pages mémorisées au démarrage (30 items par page)
+NEW_DAYS = 60                  # un item créé il y a moins de X jours compte comme "nouveau"
+ALERT_NEW_NON_LIMITED = True   # alerter aussi sur les nouveaux items Roblox non limited
+ALERT_BACK_ON_SALE = True      # alerte quand un item hors vente repasse en vente
+INCLUDE_OFFSALE = True         # mets False si l'API renvoie une erreur 400
+TEST_ON_START = os.environ.get("TEST_ON_START") == "1"
+RETRIES = 3
+
 WATCHLIST = [
     ("Bundle", 319226),  # Korblox Deathwalker
 ]
@@ -53,33 +60,53 @@ WATCHLIST = [
 API_URL = "https://catalog.roblox.com/v1/search/items/details"
 DETAILS_URL = "https://catalog.roblox.com/v1/catalog/items/details"
 BASE_PARAMS = {
-    "Category": 1,             # 1 = tout
-    "CreatorTargetId": 1,      # 1 = le compte Roblox
-    "CreatorType": "User",     # obligatoire avec CreatorTargetId
-    "SortType": 3,             # 3 = Updated (les plus récemment modifiés d'abord)
+    "Category": 1,
+    "CreatorTargetId": 1,
+    "CreatorType": "User",
+    "SortType": 3,
     "Limit": 30,
 }
 if INCLUDE_OFFSALE:
     BASE_PARAMS["IncludeNotForSale"] = "true"
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RobloxCatalogNotifier/2.0)"}
 LIMITED_TAGS = {"Collectible", "Limited", "LimitedUnique"}
 
-tracked_items = {}   # "Type:id" -> {"limited": bool, "on_sale": bool}
+tracked_items = {}
 csrf_token = None
-last_request_time = 0.0
+limiter = None
+background_tasks = set()
+proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+
+
+# ---------------- Limiteur de requêtes ----------------
+class Limiter:
+    """Espace les requêtes d'au moins `gap` secondes, et gère les pauses après un 429."""
+
+    def __init__(self, gap):
+        self.gap = gap
+        self.next_time = 0.0
+        self.cooldown_until = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next_time, self.cooldown_until)
+            self.next_time = start + self.gap
+        delay = start - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def penalize(self, seconds):
+        self.cooldown_until = max(self.cooldown_until, time.monotonic() + seconds)
+
+
+def next_proxy():
+    return next(proxy_cycle) if proxy_cycle else None
 
 
 # ---------------- Outils ----------------
-def throttle():
-    """Attend si besoin pour qu'il y ait au moins MIN_REQUEST_GAP secondes entre deux requêtes Roblox."""
-    global last_request_time
-    wait = MIN_REQUEST_GAP - (time.time() - last_request_time)
-    if wait > 0:
-        time.sleep(wait)
-    last_request_time = time.time()
-
-
 def item_key(item):
     return f"{item.get('itemType', 'Asset')}:{item.get('id')}"
 
@@ -93,11 +120,9 @@ def is_limited(item):
 
 
 def is_on_sale(item):
-    """Vrai si l'item peut être acheté directement chez Roblox."""
     status = normalize(item.get("priceStatus"))
     if status == "offsale":
         return False
-    # limited avec un stock : en vente tant qu'il reste des exemplaires chez Roblox
     if is_limited(item) and (item.get("totalQuantity") or 0) > 0:
         return (item.get("unitsAvailableForConsumption") or 0) > 0
     if status == "free":
@@ -125,53 +150,46 @@ def debug_item(item):
     )
 
 
-def backoff_delay(response, attempt):
-    """Pause supplémentaire après un 429 (en plus des 20s déjà imposées par throttle)."""
-    try:
-        base = int(response.headers.get("Retry-After", 10))
-    except ValueError:
-        base = 10
-    return base + attempt * 10
-
-
 # ---------------- Requêtes Roblox ----------------
-def fetch_page(cursor=None):
-    """Retourne (items, curseur de la page suivante), ou (None, None) si la requête a échoué."""
+async def fetch_page(session, cursor=None):
+    """Retourne (items, curseur suivant) ou (None, None) en cas d'échec."""
     params = dict(BASE_PARAMS)
     if cursor:
         params["Cursor"] = cursor
 
     for attempt in range(1, RETRIES + 1):
-        throttle()
+        await limiter.wait()
         try:
-            response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10)
+            async with session.get(
+                API_URL, params=params, headers=HEADERS, proxy=next_proxy(),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status == 429:
+                    try:
+                        wait = int(r.headers.get("Retry-After", 5))
+                    except ValueError:
+                        wait = 5
+                    print(f"429 Roblox, pause de {wait}s ({attempt}/{RETRIES})")
+                    limiter.penalize(wait)
+                    continue
+                if r.status != 200:
+                    print(f"Erreur API Roblox {r.status} : {(await r.text())[:200]}")
+                    return None, None
+                body = await r.json()
         except Exception as e:
             print(f"Erreur réseau : {e}")
             continue
 
-        if response.status_code == 429:
-            wait = backoff_delay(response, attempt)
-            print(f"Limite de requêtes Roblox (429), pause de {wait}s puis nouvel essai ({attempt}/{RETRIES})")
-            time.sleep(wait)
-            continue
-
-        if response.status_code != 200:
-            print(f"Erreur API Roblox {response.status_code} : {response.text[:200]}")
-            return None, None
-
-        body = response.json()
         items = [
             i for i in body.get("data", [])
             if i.get("creatorTargetId") == 1 and i.get("creatorType", "User") == "User"
         ]
         return items, body.get("nextPageCursor")
 
-    print("Requête abandonnée après plusieurs essais, on réessaiera au prochain tour.")
     return None, None
 
 
-def fetch_watchlist():
-    """Détails des items de la WATCHLIST (requête POST, avec jeton CSRF)."""
+async def fetch_watchlist(session):
     global csrf_token
     if not WATCHLIST:
         return []
@@ -183,35 +201,36 @@ def fetch_watchlist():
         if csrf_token:
             headers["x-csrf-token"] = csrf_token
 
-        throttle()
+        await limiter.wait()
         try:
-            response = requests.post(DETAILS_URL, json=payload, headers=headers, timeout=10)
+            async with session.post(
+                DETAILS_URL, json=payload, headers=headers, proxy=next_proxy(),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status == 403 and r.headers.get("x-csrf-token"):
+                    csrf_token = r.headers["x-csrf-token"]
+                    continue
+                if r.status == 429:
+                    try:
+                        wait = int(r.headers.get("Retry-After", 5))
+                    except ValueError:
+                        wait = 5
+                    print(f"429 Roblox (watchlist), pause de {wait}s")
+                    limiter.penalize(wait)
+                    continue
+                if r.status != 200:
+                    print(f"Erreur watchlist {r.status} : {(await r.text())[:200]}")
+                    return []
+                return (await r.json()).get("data", [])
         except Exception as e:
             print(f"Erreur réseau (watchlist) : {e}")
             continue
-
-        if response.status_code == 403 and response.headers.get("x-csrf-token"):
-            csrf_token = response.headers["x-csrf-token"]  # Roblox demande un jeton, on réessaie avec
-            continue
-
-        if response.status_code == 429:
-            wait = backoff_delay(response, attempt)
-            print(f"Limite de requêtes Roblox (429) sur la watchlist, pause de {wait}s puis nouvel essai")
-            time.sleep(wait)
-            continue
-
-        if response.status_code != 200:
-            print(f"Erreur watchlist {response.status_code} : {response.text[:200]}")
-            return []
-
-        return response.json().get("data", [])
 
     return []
 
 
 # ---------------- Détection ----------------
 def evaluate(item):
-    """Compare l'item à l'état mémorisé, met à jour la mémoire, et retourne une raison d'alerte (ou None)."""
     key = item_key(item)
     limited = is_limited(item)
     on_sale = is_on_sale(item)
@@ -219,35 +238,26 @@ def evaluate(item):
     reason = None
 
     if previous is None:
-        # item jamais vu : nouveau, ou ancien item qui remonte dans les modifiés
         if limited:
             reason = "new_limited" if is_recent(item) else "now_limited"
         elif ALERT_NEW_NON_LIMITED and is_recent(item):
             reason = "new_item"
     else:
         if ALERT_BACK_ON_SALE and not previous["on_sale"] and on_sale:
-            reason = "back_on_sale"      # il était hors vente, il est de nouveau en vente
+            reason = "back_on_sale"
         elif not previous["limited"] and limited:
-            reason = "now_limited"       # il n'était pas limited, il l'est devenu
+            reason = "now_limited"
 
     tracked_items[key] = {"limited": limited, "on_sale": on_sale}
     return reason
 
 
-def seed_tracked_items():
-    """Mémorise l'état actuel des items sans envoyer d'alerte."""
+async def seed_tracked_items(session):
     cursor = None
     count = 0
     pages = 0
     for _ in range(SEED_PAGES):
-        items, next_cursor = None, None
-        for attempt in range(1, 3):
-            items, next_cursor = fetch_page(cursor)
-            if items is not None:
-                break
-            print(f"Mémorisation : page {pages + 1} indisponible, nouvel essai dans 30s ({attempt}/2)")
-            time.sleep(30)
-
+        items, next_cursor = await fetch_page(session, cursor)
         if items is None:
             print("Mémorisation interrompue, on continue avec ce qu'on a déjà.")
             break
@@ -266,142 +276,169 @@ def seed_tracked_items():
         if not cursor:
             break
 
-    limited_count = sum(1 for v in tracked_items.values() if v["limited"])
-    on_sale_count = sum(1 for v in tracked_items.values() if v["on_sale"])
-    print(
-        f"Démarrage : {count} items Roblox mémorisés ({limited_count} limited, {on_sale_count} en vente, "
-        f"{pages}/{SEED_PAGES} pages), sans alerte."
-    )
+    print(f"Démarrage : {count} items mémorisés ({pages}/{SEED_PAGES} pages), sans alerte.")
 
-    watch_items = fetch_watchlist()
-    for item in watch_items:
+    for item in await fetch_watchlist(session):
         evaluate(item)
-    print(f"Watchlist : {len(watch_items)}/{len(WATCHLIST)} items mémorisés.")
-    for item in watch_items:
-        debug_item(item)
-    if watch_items:
-        print("Réponse brute du premier item surveillé : " + json.dumps(watch_items[0])[:1500])
 
 
 # ---------------- Discord ----------------
-def get_thumbnail(item):
-    item_id = item["id"]
+SALE_LOCATIONS = {
+    "shoponly": "Website only",
+    "experiencesdevapionly": "Experiences only",
+    "shopandallexperiences": "Website and experiences",
+    "shopandmyexperiences": "Website and creator's experiences",
+}
+
+
+async def get_thumbnail(session, item):
     if item.get("itemType") == "Bundle":
         url = "https://thumbnails.roblox.com/v1/bundles/thumbnails"
-        params = {"bundleIds": item_id, "size": "420x420", "format": "Png"}
+        params = {"bundleIds": item["id"], "size": "420x420", "format": "Png"}
     else:
         url = "https://thumbnails.roblox.com/v1/assets"
-        params = {"assetIds": item_id, "size": "420x420", "format": "Png"}
+        params = {"assetIds": item["id"], "size": "420x420", "format": "Png"}
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            if data and data[0].get("imageUrl"):
-                return data[0]["imageUrl"]
-    except Exception as e:
-        print(f"Erreur miniature : {e}")
+        async with session.get(
+            url, params=params, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=2.5)
+        ) as r:
+            if r.status == 200:
+                data = (await r.json()).get("data", [])
+                if data and data[0].get("imageUrl"):
+                    return data[0]["imageUrl"]
+    except Exception:
+        pass
     return None
 
 
-def send_discord_alert(item, reason):
-    """reason : "new_limited", "now_limited", "back_on_sale" ou "new_item"."""
+async def send_discord_alert(session, item, reason):
     item_id = item["id"]
     name = item.get("name", "Unknown item")
-    price = item.get("price") or 0
     is_bundle = item.get("itemType") == "Bundle"
-    kind = "Bundle" if is_bundle else "Item"
     item_url = f"https://www.roblox.com/{'bundles' if is_bundle else 'catalog'}/{item_id}"
 
-    if reason == "new_limited":
-        label, color = f"New Roblox Limited {kind}", 3447003
-    elif reason == "now_limited":
-        label, color = f"Roblox {kind} just became Limited", 15105570
-    elif reason == "back_on_sale":
-        label, color = f"{kind} is back on sale!", 3066993
-    else:
-        label, color = f"New Roblox {kind}", 3447003
+    titles = {
+        "new_limited": ("New Limited", 0xE0457B),
+        "now_limited": ("Went Limited", 0xE0457B),
+        "back_on_sale": ("Back On Sale", 0x2ECC71),
+        "new_item": ("New Item", 0x3498DB),
+    }
+    author, color = titles.get(reason, ("Update", 0x3498DB))
 
-    stock_text = ""
-    if is_limited(item):
-        stock = item.get("totalQuantity") or 0
-        stock_text = f" 📦 Stock: {stock}" if stock > 0 else " 📦 Limited"
+    price = item.get("price")
+    price_text = f"R${price:,}" if isinstance(price, int) and price > 0 else (item.get("priceStatus") or "Free")
 
-    creator_id = item.get("creatorTargetId")
-    creator_name = item.get("creatorName", "Roblox")
-    if item.get("creatorType") == "Group":
-        creator_link = f"https://www.roblox.com/communities/{creator_id}"
-    else:
-        creator_link = f"https://www.roblox.com/users/{creator_id or 1}/profile"
+    total = item.get("totalQuantity") or 0
+    available = item.get("unitsAvailableForConsumption") or 0
+    quantity_text = f"{available}/{total}" if total > 0 else "Unlimited"
 
-    price_text = f"{price} Robux" if price > 0 else (item.get("priceStatus") or "Free")
+    description = (item.get("description") or "No description").strip()
+    if len(description) > 300:
+        description = description[:297] + "..."
+
+    location = SALE_LOCATIONS.get(
+        normalize(item.get("saleLocationType")), item.get("saleLocationType") or "Unknown"
+    )
+
+    thumb = await get_thumbnail(session, item)
 
     embed = {
-        "description": f"**[{name}]({item_url})**\n{label}{stock_text}\n🌐 [Roblox Page]({item_url})",
+        "author": {"name": author},
+        "title": name,
+        "url": item_url,
         "color": color,
+        "description": (
+            f"**Asset ID:** {item_id}\n\n"
+            f"**Description:**\n{description}\n\n"
+            f"**Purchase location:**\n{location}"
+        ),
         "fields": [
-            {"name": "Creator", "value": f"[{creator_name}]({creator_link})", "inline": False},
-            {"name": "💰 Price", "value": price_text, "inline": True},
+            {"name": "Price", "value": price_text, "inline": True},
+            {"name": "Quantity", "value": quantity_text, "inline": True},
         ],
-        "footer": {"text": "Roblox Catalog Notifier"},
+        "footer": {"text": "Detected at:"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    thumb = get_thumbnail(item)
     if thumb:
         embed["thumbnail"] = {"url": thumb}
 
-    try:
-        response = requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
-        if response.status_code in (200, 204):
-            print(f"Alerte envoyée ({reason}) : {name}")
-        else:
-            print(f"Erreur Discord ({response.status_code}) : {response.text[:200]}")
-    except Exception as e:
-        print(f"Erreur webhook : {e}")
+    body = {"embeds": [embed]}
+    if LIMITED_ROLE_ID and reason in ("new_limited", "now_limited"):
+        body["content"] = f"<@&{LIMITED_ROLE_ID}>"
+        body["allowed_mentions"] = {"roles": [LIMITED_ROLE_ID]}
+
+    for attempt in range(3):
+        try:
+            async with session.post(WEBHOOK_URL, json=body, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status in (200, 204):
+                    print(f"Alerte envoyée ({reason}) : {name}")
+                    return
+                if r.status == 429:
+                    data = await r.json()
+                    await asyncio.sleep(float(data.get("retry_after", 1)))
+                    continue
+                print(f"Erreur Discord ({r.status}) : {(await r.text())[:200]}")
+                return
+        except Exception as e:
+            print(f"Erreur webhook : {e}")
+            await asyncio.sleep(1)
+
+
+def fire_alert(session, item, reason):
+    """Envoie l'alerte en tâche de fond pour ne pas ralentir la détection."""
+    task = asyncio.create_task(send_discord_alert(session, item, reason))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 # ---------------- Boucle principale ----------------
-print("Bot de surveillance Roblox démarré...")
-seed_tracked_items()
-first_check = True
-loop_count = 0
+async def main():
+    global limiter
+    limiter = Limiter(MIN_REQUEST_GAP / max(1, len(PROXIES)))
+    print(f"Bot démarré (délai {limiter.gap:.2f}s entre requêtes, {len(PROXIES)} proxy(s)).")
 
-while True:
-    items, _ = fetch_page()
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=30)) as session:
+        await seed_tracked_items(session)
+        first_check = True
+        loop_count = 0
 
-    watch_items = []
-    if WATCHLIST and loop_count % WATCHLIST_EVERY == 0:
-        watch_items = fetch_watchlist()
-    loop_count += 1
+        while True:
+            tasks = [fetch_page(session)]
+            check_watch = bool(WATCHLIST) and loop_count % WATCHLIST_EVERY == 0
+            if check_watch:
+                tasks.append(fetch_watchlist(session))
+            loop_count += 1
 
-    if items is None and not watch_items:
-        time.sleep(INTERVAL)
-        continue
+            results = await asyncio.gather(*tasks)
+            items = results[0][0]
+            watch_items = results[1] if check_watch else []
 
-    items = (items or []) + watch_items
+            if items is None and not watch_items:
+                await asyncio.sleep(1)
+                continue
 
-    top = ", ".join(i.get("name", "?") for i in items[:3])
-    print(f"[{time.strftime('%H:%M:%S')} UTC] {len(items)} items vérifiés (dont {len(watch_items)} surveillés). Début : {top}")
+            items = (items or []) + watch_items
 
-    if first_check:
-        first_check = False
-        if TEST_ON_START and items:
-            send_discord_alert(items[0], "new_item")
-            print("Alerte test envoyée pour vérifier le webhook.")
+            if first_check:
+                first_check = False
+                if TEST_ON_START and items:
+                    fire_alert(session, items[0], "new_item")
+                    print("Alerte test envoyée.")
 
-    alerts = []
-    for item in items:
-        if not item.get("id"):
-            continue
-        reason = evaluate(item)
-        if reason:
-            alerts.append((item, reason))
+            alerts = []
+            for item in items:
+                if item.get("id"):
+                    reason = evaluate(item)
+                    if reason:
+                        alerts.append((item, reason))
 
-    for item, reason in reversed(alerts):  # du plus ancien au plus récent
-        send_discord_alert(item, reason)
-        time.sleep(1)
+            for item, reason in reversed(alerts):
+                fire_alert(session, item, reason)
 
-    # on évite que la mémoire grossisse indéfiniment
-    if len(tracked_items) > 2000:
-        for key in list(tracked_items)[:500]:
-            del tracked_items[key]
+            if len(tracked_items) > 2000:
+                for key in list(tracked_items)[:500]:
+                    del tracked_items[key]
 
-    time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    asyncio.run(main())
