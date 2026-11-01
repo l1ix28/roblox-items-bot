@@ -20,6 +20,7 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))  # secondes entre 2 req
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # ID du rôle @limited (optionnel)
 CATEGORY = os.getenv("CATALOG_CATEGORY", "1")  # à ajuster si besoin
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
+TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"  # Activé via ta variable sur Render
 
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
@@ -147,6 +148,11 @@ async def main() -> None:
         for it in items:
             state[it["id"]] = is_limited(it)
         print(f"[init] {len(state)} items en cache. Surveillance lancée.")
+
+        # Test au démarrage si activé via la variable Render
+        if TEST_ON_START and items:
+            print("[test] Envoi d'une alerte de test au démarrage...")
+            asyncio.create_task(send_webhook(session, build_payload(items[0])))
 
         while True:
             started = time.monotonic()
