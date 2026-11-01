@@ -64,7 +64,7 @@ BASE_PARAMS = {
     "CreatorTargetId": 1,
     "CreatorType": "User",
     "SortType": 3,
-    "Limit": 30,
+    "Limit": 10,
 }
 if INCLUDE_OFFSALE:
     BASE_PARAMS["IncludeNotForSale"] = "true"
