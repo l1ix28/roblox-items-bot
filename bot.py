@@ -74,7 +74,7 @@ LIST_PARAMS = {
     "CreatorTargetId": 1,
     "CreatorType": "User",
     "SortType": 3,        # 3 = Updated (les plus récemment modifiés d'abord)
-    "Limit": 10,
+    "Limit": 30,
 }
 if INCLUDE_OFFSALE:
     LIST_PARAMS["IncludeNotForSale"] = "true"
@@ -135,8 +135,13 @@ def next_proxy(kind="list"):
 
 
 def current_gap():
-    """Délai fixe entre deux requêtes de liste (sans division par le nombre de proxies)."""
-    return MIN_REQUEST_GAP
+    """Délai entre deux requêtes de liste : divisé par le nombre de proxies actifs."""
+    if not PROXIES:
+        return MIN_REQUEST_GAP
+    now = time.monotonic()
+    active = sum(1 for p in PROXIES if proxy_cooldown.get(("list", p), 0) <= now)
+    return MIN_REQUEST_GAP / max(1, active)
+
 
 def retry_after(response):
     try:
@@ -244,46 +249,10 @@ async def fetch_list(session):
 
 
 async def fetch_details(session, pairs):
-    """Détails de plusieurs items [(type, id), ...] (requête POST, avec jeton CSRF et pause anti-saturation)."""
+    """Détails de plusieurs items [(type, id), ...] (requête POST, avec jeton CSRF)."""
     global csrf_token
     if not pairs:
         return []
-
-    payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
-
-    for attempt in range(1, DETAILS_ATTEMPTS + 1):
-        headers = dict(HEADERS)
-        if csrf_token:
-            headers["x-csrf-token"] = csrf_token
-
-        proxy = next_proxy("details")
-        
-        # Petit délai de sécurité entre chaque tentative de détails pour ne pas saturer le proxy
-        await asyncio.sleep(0.8)
-
-        try:
-            async with session.post(
-                DETAILS_URL, json=payload, headers=headers, proxy=real_proxy(proxy),
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                if r.status == 403 and r.headers.get("x-csrf-token"):
-                    csrf_token = r.headers["x-csrf-token"]
-                    continue
-                if r.status == 429:
-                    handle_429(proxy, retry_after(r), "details", " (détails)")
-                    await asyncio.sleep(2.0)
-                    continue
-                if r.status != 200:
-                    print(f"Erreur détails {r.status} : {(await r.text())[:200]}")
-                    await asyncio.sleep(1.0)
-                    continue
-                return (await r.json()).get("data", [])
-        except Exception as e:
-            print(f"Erreur réseau (détails) : {e!r}")
-            await asyncio.sleep(1.0)
-            continue
-
-    return []
 
     payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
 
