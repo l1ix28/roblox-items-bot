@@ -217,6 +217,12 @@ async def fetch_list(session):
     for attempt in range(1, RETRIES + 1):
         await limiter.wait()
         proxy = next_proxy("list")
+        if proxy:
+            remaining = proxy_cooldown.get(("list", proxy), 0) - time.monotonic()
+            if remaining > 0:
+                # tous les accès sont en pause après des 429 : inutile d'insister, on attend la fin de la pause
+                print(f"Tous les accès sont en pause, reprise dans {remaining:.0f}s")
+                await asyncio.sleep(remaining)
         try:
             async with session.get(
                 LIST_URL, params=LIST_PARAMS, headers=HEADERS, proxy=real_proxy(proxy),
