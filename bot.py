@@ -8,6 +8,10 @@ from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
+import functools
+
+# Affiche les logs tout de suite (sinon Render les regroupe et ils ont tous la même heure)
+print = functools.partial(print, flush=True)
 
 
 # --- Mini serveur HTTP pour satisfaire Render (Web Service) ---
@@ -102,8 +106,31 @@ class Limiter:
         self.cooldown_until = max(self.cooldown_until, time.monotonic() + seconds)
 
 
+proxy_cooldown = {}
+
+
 def next_proxy():
-    return next(proxy_cycle) if proxy_cycle else None
+    """Renvoie le prochain proxy qui n'est pas en pause (ou None si on n'utilise pas de proxy)."""
+    if not proxy_cycle:
+        return None
+    now = time.monotonic()
+    for _ in range(len(PROXIES)):
+        p = next(proxy_cycle)
+        if proxy_cooldown.get(p, 0) <= now:
+            return p
+    # tous en pause : on prend celui qui sera libre le plus tôt
+    return min(PROXIES, key=lambda p: proxy_cooldown.get(p, 0))
+
+
+def handle_429(proxy, wait, label=""):
+    """429 : on met ce proxy en pause (les autres continuent). Sans proxy, on met tout en pause."""
+    if proxy:
+        pause = max(wait, 30)
+        proxy_cooldown[proxy] = time.monotonic() + pause
+        print(f"429 Roblox{label} via {proxy.split('@')[-1]} : ce proxy est mis en pause {pause}s")
+    else:
+        limiter.penalize(wait)
+        print(f"429 Roblox{label} (sans proxy) : pause de {wait}s")
 
 
 # ---------------- Outils ----------------
@@ -159,9 +186,10 @@ async def fetch_page(session, cursor=None):
 
     for attempt in range(1, RETRIES + 1):
         await limiter.wait()
+        proxy = next_proxy()
         try:
             async with session.get(
-                API_URL, params=params, headers=HEADERS, proxy=next_proxy(),
+                API_URL, params=params, headers=HEADERS, proxy=proxy,
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 if r.status == 429:
@@ -169,8 +197,7 @@ async def fetch_page(session, cursor=None):
                         wait = int(r.headers.get("Retry-After", 5))
                     except ValueError:
                         wait = 5
-                    print(f"429 Roblox, pause de {wait}s ({attempt}/{RETRIES})")
-                    limiter.penalize(wait)
+                    handle_429(proxy, wait)
                     continue
                 if r.status != 200:
                     print(f"Erreur API Roblox {r.status} : {(await r.text())[:200]}")
@@ -202,9 +229,10 @@ async def fetch_watchlist(session):
             headers["x-csrf-token"] = csrf_token
 
         await limiter.wait()
+        proxy = next_proxy()
         try:
             async with session.post(
-                DETAILS_URL, json=payload, headers=headers, proxy=next_proxy(),
+                DETAILS_URL, json=payload, headers=headers, proxy=proxy,
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as r:
                 if r.status == 403 and r.headers.get("x-csrf-token"):
@@ -215,8 +243,7 @@ async def fetch_watchlist(session):
                         wait = int(r.headers.get("Retry-After", 5))
                     except ValueError:
                         wait = 5
-                    print(f"429 Roblox (watchlist), pause de {wait}s")
-                    limiter.penalize(wait)
+                    handle_429(proxy, wait, " (watchlist)")
                     continue
                 if r.status != 200:
                     print(f"Erreur watchlist {r.status} : {(await r.text())[:200]}")
@@ -305,11 +332,14 @@ async def get_thumbnail(session, item, timeout=2.0):
         ) as r:
             if r.status == 200:
                 data = (await r.json()).get("data", [])
-                # state "Pending" = image pas encore générée par Roblox : on réessaiera plus tard
-                if data and data[0].get("state") == "Completed" and data[0].get("imageUrl"):
+                if data and data[0].get("imageUrl"):
                     return data[0]["imageUrl"]
-    except Exception:
-        pass
+                state = data[0].get("state") if data else "aucune donnée"
+                print(f"Miniature pas prête pour {item['id']} (état : {state})")
+            else:
+                print(f"Miniature : erreur HTTP {r.status} pour {item['id']}")
+    except Exception as e:
+        print(f"Miniature : erreur pour {item['id']} : {e!r}")
     return None
 
 
@@ -414,7 +444,21 @@ async def send_discord_alert(session, item, reason):
             except Exception as e:
                 print(f"Erreur ajout image : {e}")
             return
-    print(f"Pas d'image disponible pour {name}")
+    # Dernier recours : lien direct d'image Roblox (redirige vers l'image quand elle existe)
+    if is_bundle:
+        fallback = f"https://www.roblox.com/bundle-thumbnail/image?bundleId={item_id}&width=420&height=420&format=png"
+    else:
+        fallback = f"https://www.roblox.com/asset-thumbnail/image?assetId={item_id}&width=420&height=420&format=png"
+    embed["thumbnail"] = {"url": fallback}
+    try:
+        async with session.patch(
+            f"{WEBHOOK_URL}/messages/{message_id}",
+            json={"embeds": [embed]},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            print(f"Image de secours ajoutée pour {name} (HTTP {r.status})")
+    except Exception as e:
+        print(f"Erreur image de secours : {e}")
 
 
 def fire_alert(session, item, reason):
