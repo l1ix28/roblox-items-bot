@@ -340,7 +340,7 @@ async def seed(session):
         return
 
     known_order = [i for _, i in pairs]
-    details = await fetch_details(session, pairs[:REFRESH_TOP * 2] + WATCHLIST)
+    details = await fetch_details(session, pairs + WATCHLIST)   # tous les items de la liste, pour éviter les fausses alertes
     print("Exemples d'items reçus :")
     for item in details[:5]:
         debug_item(item)
