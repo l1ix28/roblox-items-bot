@@ -291,7 +291,7 @@ SALE_LOCATIONS = {
 }
 
 
-async def get_thumbnail(session, item):
+async def get_thumbnail(session, item, timeout=2.0):
     if item.get("itemType") == "Bundle":
         url = "https://thumbnails.roblox.com/v1/bundles/thumbnails"
         params = {"bundleIds": item["id"], "size": "420x420", "format": "Png"}
@@ -300,11 +300,13 @@ async def get_thumbnail(session, item):
         params = {"assetIds": item["id"], "size": "420x420", "format": "Png"}
     try:
         async with session.get(
-            url, params=params, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=2.5)
+            url, params=params, headers=HEADERS, proxy=next_proxy(),
+            timeout=aiohttp.ClientTimeout(total=timeout),
         ) as r:
             if r.status == 200:
                 data = (await r.json()).get("data", [])
-                if data and data[0].get("imageUrl"):
+                # state "Pending" = image pas encore générée par Roblox : on réessaiera plus tard
+                if data and data[0].get("state") == "Completed" and data[0].get("imageUrl"):
                     return data[0]["imageUrl"]
     except Exception:
         pass
@@ -367,12 +369,19 @@ async def send_discord_alert(session, item, reason):
         body["content"] = f"<@&{LIMITED_ROLE_ID}>"
         body["allowed_mentions"] = {"roles": [LIMITED_ROLE_ID]}
 
+    message_id = None
     for attempt in range(3):
         try:
-            async with session.post(WEBHOOK_URL, json=body, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with session.post(
+                f"{WEBHOOK_URL}?wait=true", json=body, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
                 if r.status in (200, 204):
                     print(f"Alerte envoyée ({reason}) : {name}")
-                    return
+                    try:
+                        message_id = (await r.json()).get("id")
+                    except Exception:
+                        message_id = None
+                    break
                 if r.status == 429:
                     data = await r.json()
                     await asyncio.sleep(float(data.get("retry_after", 1)))
@@ -382,6 +391,30 @@ async def send_discord_alert(session, item, reason):
         except Exception as e:
             print(f"Erreur webhook : {e}")
             await asyncio.sleep(1)
+    else:
+        return
+
+    # Si l'image n'était pas prête à l'envoi, on réessaie quelques secondes
+    # puis on modifie le message pour l'ajouter.
+    if thumb or not message_id:
+        return
+    for delay in (2, 3, 5, 8):
+        await asyncio.sleep(delay)
+        thumb = await get_thumbnail(session, item, timeout=5)
+        if thumb:
+            embed["thumbnail"] = {"url": thumb}
+            try:
+                async with session.patch(
+                    f"{WEBHOOK_URL}/messages/{message_id}",
+                    json={"embeds": [embed]},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status != 200:
+                        print(f"Erreur ajout image ({r.status}) : {(await r.text())[:200]}")
+            except Exception as e:
+                print(f"Erreur ajout image : {e}")
+            return
+    print(f"Pas d'image disponible pour {name}")
 
 
 def fire_alert(session, item, reason):
