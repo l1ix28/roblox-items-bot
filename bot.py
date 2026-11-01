@@ -244,10 +244,46 @@ async def fetch_list(session):
 
 
 async def fetch_details(session, pairs):
-    """Détails de plusieurs items [(type, id), ...] (requête POST, avec jeton CSRF)."""
+    """Détails de plusieurs items [(type, id), ...] (requête POST, avec jeton CSRF et pause anti-saturation)."""
     global csrf_token
     if not pairs:
         return []
+
+    payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
+
+    for attempt in range(1, DETAILS_ATTEMPTS + 1):
+        headers = dict(HEADERS)
+        if csrf_token:
+            headers["x-csrf-token"] = csrf_token
+
+        proxy = next_proxy("details")
+        
+        # Petit délai de sécurité entre chaque tentative de détails pour ne pas saturer le proxy
+        await asyncio.sleep(0.8)
+
+        try:
+            async with session.post(
+                DETAILS_URL, json=payload, headers=headers, proxy=real_proxy(proxy),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status == 403 and r.headers.get("x-csrf-token"):
+                    csrf_token = r.headers["x-csrf-token"]
+                    continue
+                if r.status == 429:
+                    handle_429(proxy, retry_after(r), "details", " (détails)")
+                    await asyncio.sleep(2.0)
+                    continue
+                if r.status != 200:
+                    print(f"Erreur détails {r.status} : {(await r.text())[:200]}")
+                    await asyncio.sleep(1.0)
+                    continue
+                return (await r.json()).get("data", [])
+        except Exception as e:
+            print(f"Erreur réseau (détails) : {e!r}")
+            await asyncio.sleep(1.0)
+            continue
+
+    return []
 
     payload = {"items": [{"itemType": t, "id": i} for t, i in pairs]}
 
