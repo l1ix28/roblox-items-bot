@@ -93,6 +93,7 @@ BOOT_URL = catalog_url(120)
 state: dict[int, bool] = {}  # asset id -> est limité
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
 cooldown_until = 0.0  # pause globale après un 429 (sans proxies)
+last_status = 0  # dernier statut HTTP du catalogue (0 = erreur réseau)
 _tasks: set[asyncio.Task] = set()
 
 
@@ -261,7 +262,8 @@ async def notify(session: aiohttp.ClientSession, item: dict, is_limited: bool) -
 
 # ---------------------------------------------------------------- catalog ---
 async def fetch_items(session: aiohttp.ClientSession, url: str) -> list[dict] | None:
-    global cooldown_until
+    global cooldown_until, last_status
+    last_status = 0
     wait = cooldown_until - time.monotonic()
     if wait > 0:
         await asyncio.sleep(wait)
@@ -269,6 +271,7 @@ async def fetch_items(session: aiohttp.ClientSession, url: str) -> list[dict] | 
     proxy = next(proxy_cycle) if proxy_cycle else None
     try:
         async with session.get(url, proxy=proxy) as r:
+            last_status = r.status
             if r.status == 429:
                 retry = float(r.headers.get("retry-after", 3))
                 if not proxy_cycle:  # une seule IP : tout le monde se met en pause
@@ -276,12 +279,29 @@ async def fetch_items(session: aiohttp.ClientSession, url: str) -> list[dict] | 
                 print(f"[catalog] rate limit ({retry}s)")
                 return None
             if r.status != 200:
-                print(f"[catalog] status {r.status}")
+                body = (await r.text())[:150].replace("\n", " ")
+                print(f"[catalog] status {r.status} | {body}")
                 return None
             return _loads(await r.read()).get("data", [])
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[catalog] network error: {e}")
+        print(f"[catalog] network error: {e!r}")
         return None
+
+
+async def pick_working_url(session: aiohttp.ClientSession, limits: list[int]):
+    """Essaie plusieurs valeurs de Limit, garde la première acceptée par l'API."""
+    for lim in limits:
+        url = catalog_url(lim)
+        while True:
+            items = await fetch_items(session, url)
+            if items is not None:
+                print(f"[init] Limit={lim} accepté")
+                return url, items
+            if last_status == 400:
+                print(f"[init] Limit={lim} refusé (400), essai de la valeur suivante")
+                break
+            await asyncio.sleep(2)  # 429 / réseau : on réessaie la même valeur
+    raise SystemExit("Aucune valeur de Limit acceptée (400) : vérifie CATEGORY / CREATOR_ID / proxies")
 
 
 def handle_item(session: aiohttp.ClientSession, item: dict) -> None:
@@ -339,12 +359,12 @@ async def main() -> None:
     async with aiohttp.ClientSession(
         headers=HEADERS, timeout=aiohttp.ClientTimeout(total=6), connector=connector
     ) as session:
+        global POLL_URL
         # Cache de démarrage large : on mémorise sans notifier
-        items = None
-        while items is None:
-            items = await fetch_items(session, BOOT_URL)
-            if items is None:
-                await asyncio.sleep(2)
+        _, items = await pick_working_url(session, [120, 60, 30, 10])
+        POLL_URL, _ = await pick_working_url(
+            session, list(dict.fromkeys([int(POLL_LIMIT), 30, 10]))
+        )
 
         first_match = None
         for it in items:
