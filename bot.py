@@ -20,7 +20,7 @@ load_dotenv()
 print = functools.partial(print, flush=True)
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))  # seconds between requests
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))  # Sweet spot optimal (0.3s)
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # @limited role ID (optional)
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
@@ -169,8 +169,6 @@ async def update_message_thumbnail(session: aiohttp.ClientSession, message_id: s
 
     embed["thumbnail"] = {"url": image_url}
     patch_url = f"{WEBHOOK_URL}/messages/{message_id}"
-    
-    # We update only the embed (without repeating content to avoid re-pinging)
     patch_payload = {"embeds": [embed]}
     
     try:
