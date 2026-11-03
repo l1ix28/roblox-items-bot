@@ -1,5 +1,5 @@
 """
-Roblox Official Notifier (Limiteds + Normal Items) -> Formatted Discord Webhook.
+Roblox Official Notifier (Instant Notification + Deferred Thumbnail)
 No action on your account: read-only public catalog API.
 """
 
@@ -83,7 +83,8 @@ async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | 
     return None
 
 
-async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: bool) -> dict:
+def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
+    """Build payload instantly without thumbnail."""
     asset_id = item["id"]
     name = item.get("name", "Unknown")
     price = item.get("price") or item.get("lowestPrice")
@@ -104,8 +105,6 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
     location_raw = item.get("saleLocationType") or "Unknown"
     location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
 
-    image_url = await get_thumbnail(session, asset_id)
-
     if is_limited:
         author_name = "New Limited"
         color = 0xE0457B  # Vibrant pink
@@ -115,7 +114,6 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
         color = 0x3498DB  # Blue
         content = None
 
-    # Invisible characters padding to force rectangular embed width on Discord
     width_pad = "\u2800" * 45
 
     embed = {
@@ -137,9 +135,6 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if image_url:
-        embed["thumbnail"] = {"url": image_url}
-
     payload = {
         "embeds": [embed],
         "allowed_mentions": {"parse": ["roles", "everyone"]},
@@ -147,19 +142,55 @@ async def build_payload(session: aiohttp.ClientSession, item: dict, is_limited: 
     if content:
         payload["content"] = content
 
-    return payload
+    return payload, embed
 
 
-async def send_webhook(session: aiohttp.ClientSession, payload: dict) -> None:
+async def send_instant_webhook(session: aiohttp.ClientSession, payload: dict) -> dict | None:
+    """Send webhook with ?wait=true to receive message ID immediately."""
+    url = f"{WEBHOOK_URL}?wait=true"
     for _ in range(3):
-        async with session.post(WEBHOOK_URL, json=payload) as r:
+        async with session.post(url, json=payload) as r:
             if r.status == 429:
                 data = await r.json()
                 await asyncio.sleep(float(data.get("retry_after", 1)))
                 continue
+            if r.status in (200, 201):
+                return await r.json()
             if r.status >= 400:
                 print(f"[webhook] error {r.status}: {await r.text()}")
-            return
+            return None
+
+
+async def update_message_thumbnail(session: aiohttp.ClientSession, message_id: str, embed: dict, asset_id: int) -> None:
+    """Fetch image in background and update the existing Discord message."""
+    image_url = await get_thumbnail(session, asset_id)
+    if not image_url:
+        return
+
+    embed["thumbnail"] = {"url": image_url}
+    patch_url = f"{WEBHOOK_URL}/messages/{message_id}"
+    
+    # We update only the embed (without repeating content to avoid re-pinging)
+    patch_payload = {"embeds": [embed]}
+    
+    try:
+        async with session.patch(patch_url, json=patch_payload) as r:
+            if r.status >= 400:
+                print(f"[webhook patch] error {r.status}: {await r.text()}")
+    except Exception as e:
+        print(f"[webhook patch] exception: {e}")
+
+
+async def process_item_notification(session, item, is_limited):
+    asset_id = item["id"]
+    payload, embed = build_base_payload(item, is_limited)
+    
+    # Step 1: Send instant alert to Discord
+    res = await send_instant_webhook(session, payload)
+    
+    # Step 2: If message was created, attach thumbnail in background
+    if res and "id" in res:
+        asyncio.create_task(update_message_thumbnail(session, res["id"], embed, asset_id))
 
 
 async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
@@ -193,11 +224,6 @@ async def start_health_server() -> None:
     port = int(os.getenv("PORT", "10000"))
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"[http] health check server running on port {port}")
-
-
-async def process_item_notification(session, item, is_limited):
-    payload = await build_payload(session, item, is_limited)
-    await send_webhook(session, payload)
 
 
 async def main() -> None:
