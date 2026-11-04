@@ -1,237 +1,33 @@
-"""
-Roblox Official Notifier (Instant Notification + Deferred Thumbnail)
-No action on your account: read-only public catalog API.
-"""
-
-import asyncio
-import functools
-import itertools
-import os
-import time
-from datetime import datetime, timezone
-
-import aiohttp
-from aiohttp import web
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Force immediate log printing on Render
-print = functools.partial(print, flush=True)
-
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))  # Sweet spot optimal (0.3s)
-PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # @limited role ID (optional)
-PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
-TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
-
-# URL filtered for official Roblox creator (CreatorTargetId=1), Accessories (Category=11), Limit=10
-CATALOG_URL = (
-    "https://catalog.roblox.com/v1/search/items/details"
-    "?Category=11&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=10"
-)
-HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
-
-SALE_LOCATIONS = {
-    "shoponly": "Website only",
-    "experiencesdevapionly": "Experiences only",
-    "shopandallexperiences": "Website and experiences",
-    "shopandmyexperiences": "Website and creator's experiences",
-    "shopandexperiencesbyid": "Website and specific experiences",
-}
-
-# id -> {"limited": bool} to store state
-state: dict[int, dict] = {}
-proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
-
-
-def normalize(value):
-    return str(value or "").replace(" ", "").replace("_", "").lower()
-
-
-def check_item_status(item: dict) -> tuple[bool, bool]:
-    """Check if it's an official Roblox item and whether it is limited."""
-    creator_id = item.get("creatorTargetId")
-    if creator_id != 1:
-        return False, False
-
-    restrictions = item.get("itemRestrictions") or []
-    total_qty = item.get("totalQuantity") or 0
-    
-    is_lim = bool(
-        "Limited" in restrictions
-        or "LimitedUnique" in restrictions
-        or "Collectible" in restrictions
-        or (total_qty > 0 and item.get("collectibleItemId"))
-    )
-    return True, is_lim
-
-
-async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | None:
-    """Fetch official item thumbnail via Roblox Thumbnail API."""
-    url = f"https://thumbnails.roblox.com/v1/assets?assetIds={asset_id}&size=420x420&format=Png"
-    proxy = next(proxy_cycle) if proxy_cycle else None
-    try:
-        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                data = await r.json()
-                results = data.get("data", [])
-                if results and results[0].get("imageUrl"):
-                    return results[0]["imageUrl"]
-    except Exception:
-        pass
-    return None
-
-
-def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
-    """Build payload instantly without thumbnail."""
-    asset_id = item["id"]
-    name = item.get("name", "Unknown")
-    price = item.get("price") or item.get("lowestPrice")
-    quantity = item.get("totalQuantity")
-    left = item.get("unitsAvailableForConsumption")
-
-    price_txt = f"R${price:,}" if isinstance(price, int) and price > 0 else "Free"
-    
-    if quantity and quantity > 0:
-        qty_txt = f"{left}/{quantity}" if left is not None else str(quantity)
-    else:
-        qty_txt = "Unlimited"
-
-    description = (item.get("description") or "").strip() or "—"
-    if len(description) > 300:
-        description = description[:297] + "..."
-
-    location_raw = item.get("saleLocationType") or "Unknown"
-    location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
-
-    if is_limited:
-        author_name = "New Limited"
-        color = 0xE0457B  # Vibrant pink
-        content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
-    else:
-        author_name = "New Roblox Item"
-        color = 0x3498DB  # Blue
-        content = None
-
-    width_pad = "\u2800" * 45
-
-    embed = {
-        "author": {"name": author_name},
-        "title": name,
-        "url": f"https://www.roblox.com/catalog/{asset_id}",
-        "color": color,
-        "description": (
-            f"**Asset ID:** {asset_id}\n\n"
-            f"**Description:**\n{description}\n\n"
-            f"**Purchase location:**\n{location}\n\n"
-            f"{width_pad}"
-        ),
-        "fields": [
-            {"name": "Price", "value": price_txt, "inline": True},
-            {"name": "Quantity", "value": qty_txt, "inline": True},
-        ],
-        "footer": {"text": "Detected at:"},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-    payload = {
-        "embeds": [embed],
-        "allowed_mentions": {"parse": ["roles", "everyone"]},
-    }
-    if content:
-        payload["content"] = content
-
-    return payload, embed
-
-
-async def send_instant_webhook(session: aiohttp.ClientSession, payload: dict) -> dict | None:
-    """Send webhook with ?wait=true to receive message ID immediately."""
-    url = f"{WEBHOOK_URL}?wait=true"
-    for _ in range(3):
-        async with session.post(url, json=payload) as r:
-            if r.status == 429:
-                data = await r.json()
-                await asyncio.sleep(float(data.get("retry_after", 1)))
-                continue
-            if r.status in (200, 201):
-                return await r.json()
-            if r.status >= 400:
-                print(f"[webhook] error {r.status}: {await r.text()}")
-            return None
-
-
-async def update_message_thumbnail(session: aiohttp.ClientSession, message_id: str, embed: dict, asset_id: int) -> None:
-    """Fetch image in background and update the existing Discord message."""
-    image_url = await get_thumbnail(session, asset_id)
-    if not image_url:
-        return
-
-    embed["thumbnail"] = {"url": image_url}
-    patch_url = f"{WEBHOOK_URL}/messages/{message_id}"
-    patch_payload = {"embeds": [embed]}
-    
-    try:
-        async with session.patch(patch_url, json=patch_payload) as r:
-            if r.status >= 400:
-                print(f"[webhook patch] error {r.status}: {await r.text()}")
-    except Exception as e:
-        print(f"[webhook patch] exception: {e}")
-
-
-async def process_item_notification(session, item, is_limited):
-    asset_id = item["id"]
-    payload, embed = build_base_payload(item, is_limited)
-    
-    # Step 1: Send instant alert to Discord
-    res = await send_instant_webhook(session, payload)
-    
-    # Step 2: If message was created, attach thumbnail in background
-    if res and "id" in res:
-        asyncio.create_task(update_message_thumbnail(session, res["id"], embed, asset_id))
-
-
-async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
-    proxy = next(proxy_cycle) if proxy_cycle else None
-    try:
-        async with session.get(CATALOG_URL, proxy=proxy) as r:
-            if r.status == 429:
-                retry = float(r.headers.get("retry-after", 5))
-                print(f"[catalog] rate limit, sleeping {retry}s")
-                await asyncio.sleep(retry)
-                return None
-            if r.status != 200:
-                print(f"[catalog] status {r.status}")
-                return None
-            return (await r.json()).get("data", [])
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[catalog] network error: {e}")
-        return None
-
-
-async def start_health_server() -> None:
-    """Mini HTTP server for Render (Web Service)."""
+async def start_health_server() -> web.AppRunner:
+    """Mini HTTP server pour Render & UptimeRobot."""
     async def health(_request: web.Request) -> web.Response:
-        return web.Response(text="ok")
+        return web.Response(text="ok", status=200)
 
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
     print(f"[http] health check server running on port {port}")
+    return runner
 
 
 async def main() -> None:
+    # 1. Lancer le serveur HTTP en tâche de fond indépendante
     await start_health_server()
+    
+    # 2. Continuer la logique de monitoring
     timeout = aiohttp.ClientTimeout(total=8)
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+    
     async with aiohttp.ClientSession(
         headers=HEADERS, timeout=timeout, connector=connector
     ) as session:
-        # Bootstrapping: caching existing items without notifying
+        # Bootstrapping: caching existing items
         items = None
         while items is None:
             items = await fetch_items(session)
@@ -252,6 +48,7 @@ async def main() -> None:
             if is_roblox:
                 asyncio.create_task(process_item_notification(session, items[0], is_lim))
 
+        # Boucle de polling
         while True:
             started = time.monotonic()
             items = await fetch_items(session)
