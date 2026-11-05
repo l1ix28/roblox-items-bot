@@ -2,6 +2,7 @@ import asyncio
 import functools
 import itertools
 import os
+import random
 import time
 from datetime import datetime, timezone
 
@@ -15,18 +16,23 @@ load_dotenv()
 print = functools.partial(print, flush=True)
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.6"))  # Légèrement ajusté pour préserver les proxies
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
-# URL mise à jour : Suppression de Category=11 pour cibler TOUS les types d'items Roblox
-# Augmentation du Limit à 30 pour ne rater aucun item si plusieurs sortent d'un coup
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
     "?CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
 )
-HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
+
+# Liste de vrais User-Agents pour simuler des navigateurs différents à chaque requête
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
 
 SALE_LOCATIONS = {
     "shoponly": "Website only",
@@ -36,9 +42,13 @@ SALE_LOCATIONS = {
     "shopandexperiencesbyid": "Website and specific experiences",
 }
 
-# id -> {"limited": bool}
 state: dict[int, dict] = {}
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+
+
+def get_random_headers() -> dict:
+    """Génère des en-têtes avec un User-Agent aléatoire pour chaque requête."""
+    return {"User-Agent": random.choice(USER_AGENTS)}
 
 
 def normalize(value):
@@ -46,7 +56,6 @@ def normalize(value):
 
 
 def check_item_status(item: dict) -> tuple[bool, bool]:
-    """Vérifie si l'item appartient à Roblox et s'il est limited."""
     creator_id = item.get("creatorTargetId")
     if creator_id != 1:
         return False, False
@@ -64,11 +73,11 @@ def check_item_status(item: dict) -> tuple[bool, bool]:
 
 
 async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | None:
-    """Récupère l'image officielle via la Thumbnail API."""
     url = f"https://thumbnails.roblox.com/v1/assets?assetIds={asset_id}&size=420x420&format=Png"
     proxy = next(proxy_cycle) if proxy_cycle else None
+    headers = get_random_headers()
     try:
-        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=5)) as r:
+        async with session.get(url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=5)) as r:
             if r.status == 200:
                 data = await r.json()
                 results = data.get("data", [])
@@ -80,7 +89,6 @@ async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | 
 
 
 def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
-    """Construit le payload Discord."""
     asset_id = item["id"]
     name = item.get("name", "Unknown")
     price = item.get("price") or item.get("lowestPrice")
@@ -184,11 +192,12 @@ async def process_item_notification(session, item, is_limited):
 
 async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
     proxy = next(proxy_cycle) if proxy_cycle else None
+    headers = get_random_headers()  # Changement de User-Agent à chaque requête catalogue
     try:
-        async with session.get(CATALOG_URL, proxy=proxy) as r:
+        async with session.get(CATALOG_URL, headers=headers, proxy=proxy) as r:
             if r.status == 429:
                 retry = float(r.headers.get("retry-after", 5))
-                print(f"[catalog] rate limit, sleeping {retry}s")
+                print(f"[catalog] rate limit on proxy, sleeping {retry}s")
                 await asyncio.sleep(retry)
                 return None
             if r.status != 200:
@@ -222,10 +231,7 @@ async def main() -> None:
     
     timeout = aiohttp.ClientTimeout(total=8)
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(
-        headers=HEADERS, timeout=timeout, connector=connector
-    ) as session:
-        # Initialisation du cache
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         items = None
         while items is None:
             items = await fetch_items(session)
@@ -245,7 +251,6 @@ async def main() -> None:
             if is_roblox:
                 asyncio.create_task(process_item_notification(session, items[0], is_lim))
 
-        # Boucle principale de détection
         while True:
             started = time.monotonic()
             items = await fetch_items(session)
@@ -258,13 +263,11 @@ async def main() -> None:
                     item_id = it["id"]
                     previous = state.get(item_id)
                     
-                    # Nouveau produit détecté
                     if previous is None:
                         state[item_id] = {"limited": is_lim}
                         print(f"[new item] {it.get('name')} ({item_id}) | Limited: {is_lim}")
                         asyncio.create_task(process_item_notification(session, it, is_lim))
                     else:
-                        # Passage de normal à Limited
                         if is_lim and not previous["limited"]:
                             state[item_id]["limited"] = True
                             print(f"[went limited] {it.get('name')} ({item_id})")
