@@ -1,3 +1,14 @@
+"""
+Roblox Official Notifier (Limiteds + Normal Items) -> Discord webhook.
+Lecture seule de l'API publique du catalogue : aucune action sur ton compte.
+
+Optimisations vitesse :
+  - plusieurs workers décalés dans le temps (polling effectif = POLL_INTERVAL)
+  - envoi du webhook IMMEDIAT, la miniature est ajoutée ensuite par édition
+  - session HTTP persistante (keep-alive), orjson/uvloop si installés
+  - cache de démarrage large (Limit=120) pour éviter les faux "nouveaux items"
+"""
+
 import asyncio
 import functools
 import itertools
@@ -6,33 +17,73 @@ import random
 import time
 from datetime import datetime, timezone
 
+from urllib.parse import quote
+
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
+try:
+    import orjson
+
+    _loads = orjson.loads
+except ImportError:  # fallback
+    import json
+
+    _loads = json.loads
+
+try:
+    import uvloop
+
+    uvloop.install()
+except ImportError:
+    pass
+
 load_dotenv()
+print = functools.partial(print, flush=True)  # logs immédiats sur Render
 
-# Force immediate log printing on Render
-print = functools.partial(print, flush=True)
-
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.6"))  # Légèrement ajusté pour préserver les proxies
+# ---------------------------------------------------------------- config ----
+WEBHOOK_URL = os.environ["WEBHOOK_URL"].split("?")[0].rstrip("/")
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))  # intervalle effectif global
+WORKERS = max(1, int(os.getenv("WORKERS", "1")))  # requêtes concurrentes décalées
+POLL_LIMIT = os.getenv("POLL_LIMIT", "30")  # valeurs acceptées par l'API : 10, 28, 30
+BOOT_PAGES = max(1, int(os.getenv("BOOT_PAGES", "3")))  # pages chargées au démarrage
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")
-PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
+
+
+def parse_proxy(raw: str) -> str:
+    """Accepte http://user:pass@ip:port ou ip:port:user:pass ou ip:port."""
+    raw = raw.strip()
+    if "://" in raw:
+        return raw
+    parts = raw.split(":")
+    if len(parts) == 4:  # ip:port:user:pass
+        ip, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{ip}:{port}"
+    return f"http://{raw}"  # ip:port
+
+
+PROXIES = [
+    parse_proxy(p) for p in os.getenv("PROXIES", "").replace("\n", ",").split(",") if p.strip()
+]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
+CATEGORY = os.getenv("CATEGORY", "")  # vide = tous les items du créateur, 11 = accessoires
+CREATOR_ID = int(os.getenv("CREATOR_ID", "1"))  # 1 = Roblox officiel
+MAX_AGE_HOURS = float(os.getenv("MAX_AGE_HOURS", "48"))  # ignore les "nouveaux" trop vieux
 
-CATALOG_URL = (
-    "https://catalog.roblox.com/v1/search/items/details"
-    "?CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
-)
+HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
-# Liste de vrais User-Agents pour simuler des navigateurs différents à chaque requête
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
 ]
+
+
+def random_headers() -> dict:
+    return {"User-Agent": random.choice(USER_AGENTS)}
+
 
 SALE_LOCATIONS = {
     "shoponly": "Website only",
@@ -42,61 +93,79 @@ SALE_LOCATIONS = {
     "shopandexperiencesbyid": "Website and specific experiences",
 }
 
-state: dict[int, dict] = {}
+
+def catalog_url(limit: str | int) -> str:
+    cat = f"Category={CATEGORY}&" if CATEGORY else ""
+    return (
+        "https://catalog.roblox.com/v1/search/items/details"
+        f"?{cat}CreatorType=User&CreatorTargetId={CREATOR_ID}&SortType=3&Limit={limit}"
+    )
+
+
+POLL_URL = catalog_url(POLL_LIMIT)
+
+# ----------------------------------------------------------------- state ----
+state: dict[int, bool] = {}  # asset id -> est limité
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+cooldown_until = 0.0  # pause globale après un 429 (sans proxies)
+last_status = 0  # dernier statut HTTP du catalogue (0 = erreur réseau)
+last_cursor = None  # curseur de la page suivante
+_tasks: set[asyncio.Task] = set()
 
 
-def get_random_headers() -> dict:
-    """Génère des en-têtes avec un User-Agent aléatoire pour chaque requête."""
-    return {"User-Agent": random.choice(USER_AGENTS)}
+def spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
 
-def normalize(value):
+# --------------------------------------------------------------- helpers ----
+def normalize(value) -> str:
     return str(value or "").replace(" ", "").replace("_", "").lower()
 
 
 def check_item_status(item: dict) -> tuple[bool, bool]:
-    creator_id = item.get("creatorTargetId")
-    if creator_id != 1:
+    """(est un item du créateur surveillé, est limité)."""
+    if item.get("creatorTargetId") != CREATOR_ID:
         return False, False
-
     restrictions = item.get("itemRestrictions") or []
     total_qty = item.get("totalQuantity") or 0
-    
-    is_lim = bool(
+    limited = bool(
         "Limited" in restrictions
         or "LimitedUnique" in restrictions
         or "Collectible" in restrictions
         or (total_qty > 0 and item.get("collectibleItemId"))
     )
-    return True, is_lim
+    return True, limited
 
 
-async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | None:
-    url = f"https://thumbnails.roblox.com/v1/assets?assetIds={asset_id}&size=420x420&format=Png"
-    proxy = next(proxy_cycle) if proxy_cycle else None
-    headers = get_random_headers()
+def is_stale(item: dict) -> bool:
+    """True si l'item est trop ancien pour être annoncé comme nouveau."""
+    raw = item.get("itemCreatedUtc") or item.get("createdUtc")
+    if not raw:
+        return False
     try:
-        async with session.get(url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                data = await r.json()
-                results = data.get("data", [])
-                if results and results[0].get("imageUrl"):
-                    return results[0]["imageUrl"]
-    except Exception:
-        pass
-    return None
+        dt = datetime.fromisoformat(str(raw).rstrip("Z").split(".")[0])
+        dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() > MAX_AGE_HOURS * 3600
 
 
-def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
+def format_price(price) -> str:
+    if price is None:
+        return "?"
+    if price == 0:
+        return "Free"
+    return f"R${price:,}"
+
+
+def build_embed(item: dict, is_limited: bool) -> tuple[dict, str | None]:
     asset_id = item["id"]
-    name = item.get("name", "Unknown")
-    price = item.get("price") or item.get("lowestPrice")
+    price = item.get("price") if item.get("price") is not None else item.get("lowestPrice")
     quantity = item.get("totalQuantity")
     left = item.get("unitsAvailableForConsumption")
 
-    price_txt = f"R${price:,}" if isinstance(price, int) and price > 0 else "Free"
-    
     if quantity and quantity > 0:
         qty_txt = f"{left}/{quantity}" if left is not None else str(quantity)
     else:
@@ -110,19 +179,15 @@ def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
     location = SALE_LOCATIONS.get(normalize(location_raw), location_raw)
 
     if is_limited:
-        author_name = "New Limited"
-        color = 0xE0457B
+        author, color = "New Limited", 0xE0457B
         content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
     else:
-        author_name = "New Roblox Item"
-        color = 0x3498DB
-        content = None
+        author, color, content = "New Roblox Item", 0x3498DB, None
 
-    width_pad = "\u2800" * 45
-
+    width_pad = "\u2800" * 45  # force un embed large
     embed = {
-        "author": {"name": author_name},
-        "title": name,
+        "author": {"name": author},
+        "title": item.get("name", "Unknown"),
         "url": f"https://www.roblox.com/catalog/{asset_id}",
         "color": color,
         "description": (
@@ -132,149 +197,219 @@ def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
             f"{width_pad}"
         ),
         "fields": [
-            {"name": "Price", "value": price_txt, "inline": True},
+            {"name": "Price", "value": format_price(price), "inline": True},
             {"name": "Quantity", "value": qty_txt, "inline": True},
         ],
         "footer": {"text": "Detected at:"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    return embed, content
 
-    payload = {
-        "embeds": [embed],
-        "allowed_mentions": {"parse": ["roles", "everyone"]},
-    }
+
+# --------------------------------------------------------------- discord ----
+async def post_webhook(session: aiohttp.ClientSession, payload: dict) -> str | None:
+    """Envoie le message, retourne son ID (pour l'éditer ensuite)."""
+    for _ in range(4):
+        try:
+            async with session.post(f"{WEBHOOK_URL}?wait=true", json=payload) as r:
+                if r.status == 429:
+                    data = _loads(await r.read())
+                    await asyncio.sleep(float(data.get("retry_after", 1)))
+                    continue
+                if r.status >= 500:
+                    await asyncio.sleep(0.5)
+                    continue
+                if r.status >= 400:
+                    print(f"[webhook] error {r.status}: {await r.text()}")
+                    return None
+                return _loads(await r.read()).get("id")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[webhook] network error: {e}")
+            await asyncio.sleep(0.5)
+    return None
+
+
+async def fetch_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | None:
+    url = (
+        "https://thumbnails.roblox.com/v1/assets"
+        f"?assetIds={asset_id}&size=420x420&format=Png"
+    )
+    for _ in range(6):  # les miniatures d'items neufs mettent parfois quelques secondes
+        try:
+            async with session.get(
+                url, headers=random_headers(), timeout=aiohttp.ClientTimeout(total=4)
+            ) as r:
+                if r.status == 200:
+                    data = _loads(await r.read()).get("data", [])
+                    if data and data[0].get("state") == "Completed" and data[0].get("imageUrl"):
+                        return data[0]["imageUrl"]
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        await asyncio.sleep(1.5)
+    return None
+
+
+async def edit_message(session: aiohttp.ClientSession, message_id: str, embed: dict) -> None:
+    try:
+        async with session.patch(
+            f"{WEBHOOK_URL}/messages/{message_id}", json={"embeds": [embed]}
+        ) as r:
+            if r.status >= 400:
+                print(f"[webhook] edit error {r.status}: {await r.text()}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[webhook] edit network error: {e}")
+
+
+async def notify(session: aiohttp.ClientSession, item: dict, is_limited: bool) -> None:
+    embed, content = build_embed(item, is_limited)
+    payload = {"embeds": [embed], "allowed_mentions": {"parse": ["roles", "everyone"]}}
     if content:
         payload["content"] = content
 
-    return payload, embed
-
-
-async def send_instant_webhook(session: aiohttp.ClientSession, payload: dict) -> dict | None:
-    url = f"{WEBHOOK_URL}?wait=true"
-    for _ in range(3):
-        async with session.post(url, json=payload) as r:
-            if r.status == 429:
-                data = await r.json()
-                await asyncio.sleep(float(data.get("retry_after", 1)))
-                continue
-            if r.status in (200, 201):
-                return await r.json()
-            if r.status >= 400:
-                print(f"[webhook] error {r.status}: {await r.text()}")
-            return None
-
-
-async def update_message_thumbnail(session: aiohttp.ClientSession, message_id: str, embed: dict, asset_id: int) -> None:
-    image_url = await get_thumbnail(session, asset_id)
-    if not image_url:
+    # 1) envoi immédiat, sans attendre la miniature
+    message_id = await post_webhook(session, payload)
+    if not message_id:
         return
 
-    embed["thumbnail"] = {"url": image_url}
-    patch_url = f"{WEBHOOK_URL}/messages/{message_id}"
-    patch_payload = {"embeds": [embed]}
-    
-    try:
-        async with session.patch(patch_url, json=patch_payload) as r:
-            if r.status >= 400:
-                print(f"[webhook patch] error {r.status}: {await r.text()}")
-    except Exception as e:
-        print(f"[webhook patch] exception: {e}")
+    # 2) miniature ajoutée par édition
+    image = await fetch_thumbnail(session, item["id"])
+    if image:
+        embed["thumbnail"] = {"url": image}
+        await edit_message(session, message_id, embed)
 
 
-async def process_item_notification(session, item, is_limited):
-    asset_id = item["id"]
-    payload, embed = build_base_payload(item, is_limited)
-    
-    res = await send_instant_webhook(session, payload)
-    if res and "id" in res:
-        asyncio.create_task(update_message_thumbnail(session, res["id"], embed, asset_id))
+# ---------------------------------------------------------------- catalog ---
+async def fetch_items(session: aiohttp.ClientSession, url: str) -> list[dict] | None:
+    global cooldown_until, last_status, last_cursor
+    last_status = 0
+    last_cursor = None
+    wait = cooldown_until - time.monotonic()
+    if wait > 0:
+        await asyncio.sleep(wait)
 
-
-async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
     proxy = next(proxy_cycle) if proxy_cycle else None
-    headers = get_random_headers()  # Changement de User-Agent à chaque requête catalogue
     try:
-        async with session.get(CATALOG_URL, headers=headers, proxy=proxy) as r:
+        async with session.get(url, headers=random_headers(), proxy=proxy) as r:
+            last_status = r.status
             if r.status == 429:
-                retry = float(r.headers.get("retry-after", 5))
-                print(f"[catalog] rate limit on proxy, sleeping {retry}s")
-                await asyncio.sleep(retry)
+                retry = float(r.headers.get("retry-after", 3))
+                if not proxy_cycle:  # une seule IP : tout le monde se met en pause
+                    cooldown_until = time.monotonic() + retry
+                print(f"[catalog] rate limit ({retry}s)")
                 return None
             if r.status != 200:
-                print(f"[catalog] status {r.status}")
+                body = (await r.text())[:150].replace("\n", " ")
+                print(f"[catalog] status {r.status} | {body}")
                 return None
-            return (await r.json()).get("data", [])
+            body = _loads(await r.read())
+            last_cursor = body.get("nextPageCursor")
+            return body.get("data", [])
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[catalog] network error: {e}")
+        print(f"[catalog] network error: {e!r}")
         return None
 
 
-async def start_health_server():
+async def pick_working_url(session: aiohttp.ClientSession, limits: list[int]):
+    """Essaie plusieurs valeurs de Limit, garde la première acceptée par l'API."""
+    for lim in limits:
+        url = catalog_url(lim)
+        while True:
+            items = await fetch_items(session, url)
+            if items is not None:
+                print(f"[init] Limit={lim} accepté")
+                return url, items
+            if last_status == 400:
+                print(f"[init] Limit={lim} refusé (400), essai de la valeur suivante")
+                break
+            await asyncio.sleep(2)  # 429 / réseau : on réessaie la même valeur
+    raise SystemExit("Aucune valeur de Limit acceptée (400) : vérifie CATEGORY / CREATOR_ID / proxies")
+
+
+def handle_item(session: aiohttp.ClientSession, item: dict) -> None:
+    ok, limited = check_item_status(item)
+    if not ok:
+        return
+    item_id = item["id"]
+    previous = state.get(item_id)
+
+    if previous is None:
+        state[item_id] = limited  # marqué AVANT tout await : pas de doublon entre workers
+        if is_stale(item):
+            return
+        print(f"[new] {item.get('name')} ({item_id}) | limited={limited}")
+        spawn(notify(session, item, limited))
+    elif limited and not previous:
+        state[item_id] = True
+        print(f"[went limited] {item.get('name')} ({item_id})")
+        spawn(notify(session, item, True))
+
+
+async def worker(session: aiohttp.ClientSession, index: int) -> None:
+    period = POLL_INTERVAL * WORKERS
+    await asyncio.sleep(index * POLL_INTERVAL)  # décalage entre workers
+    while True:
+        started = time.monotonic()
+        try:
+            items = await fetch_items(session, POLL_URL)
+            if items:
+                for it in items:
+                    handle_item(session, it)
+        except Exception as e:  # un worker ne doit jamais mourir
+            print(f"[worker {index}] error: {e!r}")
+        await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
+
+
+# ----------------------------------------------------------------- server ---
+async def start_health_server() -> None:
     async def health(_request: web.Request) -> web.Response:
-        return web.Response(text="ok", status=200)
+        return web.Response(text="ok")
 
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"[http] health check server running on port {port}")
-    return runner
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"[http] health check server on port {port}")
 
 
 async def main() -> None:
     await start_health_server()
-    
-    timeout = aiohttp.ClientTimeout(total=8)
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        items = None
-        while items is None:
-            items = await fetch_items(session)
-            if items is None:
-                await asyncio.sleep(2)
-        
+    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, keepalive_timeout=60)
+    async with aiohttp.ClientSession(
+        headers=HEADERS, timeout=aiohttp.ClientTimeout(total=6), connector=connector
+    ) as session:
+        global POLL_URL
+        # Cache de démarrage sur plusieurs pages : on mémorise sans notifier
+        boot_url, first_page = await pick_working_url(session, [30, 28, 10])
+        items = list(first_page)
+        cursor = last_cursor
+        for _ in range(BOOT_PAGES - 1):
+            if not cursor:
+                break
+            page = await fetch_items(session, boot_url + "&Cursor=" + quote(cursor, safe=""))
+            if not page:
+                break
+            items += page
+            cursor = last_cursor
+        POLL_URL, _ = await pick_working_url(
+            session, list(dict.fromkeys([int(POLL_LIMIT), 30, 10]))
+        )
+
+        first_match = None
         for it in items:
-            is_roblox, is_lim = check_item_status(it)
-            if is_roblox:
-                state[it["id"]] = {"limited": is_lim}
-                
-        print(f"[init] {len(state)} Roblox items cached. Monitoring started.")
+            ok, limited = check_item_status(it)
+            if ok:
+                state[it["id"]] = limited
+                first_match = first_match or (it, limited)
+        print(f"[init] {len(state)} items cached | workers={WORKERS} | interval={POLL_INTERVAL}s")
 
-        if TEST_ON_START and items:
-            print("[test] Sending startup test alert...")
-            is_roblox, is_lim = check_item_status(items[0])
-            if is_roblox:
-                asyncio.create_task(process_item_notification(session, items[0], is_lim))
+        if TEST_ON_START and first_match:
+            print("[test] sending startup test alert")
+            spawn(notify(session, *first_match))
 
-        while True:
-            started = time.monotonic()
-            items = await fetch_items(session)
-            if items:
-                for it in items:
-                    is_roblox, is_lim = check_item_status(it)
-                    if not is_roblox:
-                        continue
-                    
-                    item_id = it["id"]
-                    previous = state.get(item_id)
-                    
-                    if previous is None:
-                        state[item_id] = {"limited": is_lim}
-                        print(f"[new item] {it.get('name')} ({item_id}) | Limited: {is_lim}")
-                        asyncio.create_task(process_item_notification(session, it, is_lim))
-                    else:
-                        if is_lim and not previous["limited"]:
-                            state[item_id]["limited"] = True
-                            print(f"[went limited] {it.get('name')} ({item_id})")
-                            asyncio.create_task(process_item_notification(session, it, True))
-
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.0, POLL_INTERVAL - elapsed))
+        await asyncio.gather(*(worker(session, i) for i in range(WORKERS)))
 
 
 if __name__ == "__main__":
