@@ -15,15 +15,16 @@ load_dotenv()
 print = functools.partial(print, flush=True)
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))  # Sweet spot optimal (0.3s)
-PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")  # @limited role ID (optional)
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))
+PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
-# URL filtered for official Roblox creator (CreatorTargetId=1), Accessories (Category=11), Limit=10
+# URL mise à jour : Suppression de Category=11 pour cibler TOUS les types d'items Roblox
+# Augmentation du Limit à 30 pour ne rater aucun item si plusieurs sortent d'un coup
 CATALOG_URL = (
     "https://catalog.roblox.com/v1/search/items/details"
-    "?Category=11&CreatorType=User&CreatorTargetId=1&SortType=3&Limit=10"
+    "?CreatorType=User&CreatorTargetId=1&SortType=3&Limit=30"
 )
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
@@ -35,7 +36,7 @@ SALE_LOCATIONS = {
     "shopandexperiencesbyid": "Website and specific experiences",
 }
 
-# id -> {"limited": bool} to store state
+# id -> {"limited": bool}
 state: dict[int, dict] = {}
 proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
 
@@ -45,7 +46,7 @@ def normalize(value):
 
 
 def check_item_status(item: dict) -> tuple[bool, bool]:
-    """Check if it's an official Roblox item and whether it is limited."""
+    """Vérifie si l'item appartient à Roblox et s'il est limited."""
     creator_id = item.get("creatorTargetId")
     if creator_id != 1:
         return False, False
@@ -63,7 +64,7 @@ def check_item_status(item: dict) -> tuple[bool, bool]:
 
 
 async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | None:
-    """Fetch official item thumbnail via Roblox Thumbnail API."""
+    """Récupère l'image officielle via la Thumbnail API."""
     url = f"https://thumbnails.roblox.com/v1/assets?assetIds={asset_id}&size=420x420&format=Png"
     proxy = next(proxy_cycle) if proxy_cycle else None
     try:
@@ -79,7 +80,7 @@ async def get_thumbnail(session: aiohttp.ClientSession, asset_id: int) -> str | 
 
 
 def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
-    """Build payload instantly without thumbnail."""
+    """Construit le payload Discord."""
     asset_id = item["id"]
     name = item.get("name", "Unknown")
     price = item.get("price") or item.get("lowestPrice")
@@ -102,11 +103,11 @@ def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
 
     if is_limited:
         author_name = "New Limited"
-        color = 0xE0457B  # Vibrant pink
+        color = 0xE0457B
         content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@limited"
     else:
         author_name = "New Roblox Item"
-        color = 0x3498DB  # Blue
+        color = 0x3498DB
         content = None
 
     width_pad = "\u2800" * 45
@@ -141,7 +142,6 @@ def build_base_payload(item: dict, is_limited: bool) -> tuple[dict, dict]:
 
 
 async def send_instant_webhook(session: aiohttp.ClientSession, payload: dict) -> dict | None:
-    """Send webhook with ?wait=true to receive message ID immediately."""
     url = f"{WEBHOOK_URL}?wait=true"
     for _ in range(3):
         async with session.post(url, json=payload) as r:
@@ -157,7 +157,6 @@ async def send_instant_webhook(session: aiohttp.ClientSession, payload: dict) ->
 
 
 async def update_message_thumbnail(session: aiohttp.ClientSession, message_id: str, embed: dict, asset_id: int) -> None:
-    """Fetch image in background and update the existing Discord message."""
     image_url = await get_thumbnail(session, asset_id)
     if not image_url:
         return
@@ -178,10 +177,7 @@ async def process_item_notification(session, item, is_limited):
     asset_id = item["id"]
     payload, embed = build_base_payload(item, is_limited)
     
-    # Step 1: Send instant alert to Discord
     res = await send_instant_webhook(session, payload)
-    
-    # Step 2: If message was created, attach thumbnail in background
     if res and "id" in res:
         asyncio.create_task(update_message_thumbnail(session, res["id"], embed, asset_id))
 
@@ -205,7 +201,6 @@ async def fetch_items(session: aiohttp.ClientSession) -> list[dict] | None:
 
 
 async def start_health_server():
-    """Mini HTTP server for Render (Web Service)."""
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok", status=200)
 
@@ -223,7 +218,6 @@ async def start_health_server():
 
 
 async def main() -> None:
-    # 1. Démarrer le serveur HTTP pour Render & UptimeRobot
     await start_health_server()
     
     timeout = aiohttp.ClientTimeout(total=8)
@@ -231,7 +225,7 @@ async def main() -> None:
     async with aiohttp.ClientSession(
         headers=HEADERS, timeout=timeout, connector=connector
     ) as session:
-        # Bootstrapping: caching existing items without notifying
+        # Initialisation du cache
         items = None
         while items is None:
             items = await fetch_items(session)
@@ -242,9 +236,8 @@ async def main() -> None:
             is_roblox, is_lim = check_item_status(it)
             if is_roblox:
                 state[it["id"]] = {"limited": is_lim}
-                print(f"[cached] {it.get('name')} (ID: {it['id']}) | Limited: {is_lim}")
                 
-        print(f"[init] {len(state)} official Roblox accessories cached. Monitoring started.")
+        print(f"[init] {len(state)} Roblox items cached. Monitoring started.")
 
         if TEST_ON_START and items:
             print("[test] Sending startup test alert...")
@@ -252,6 +245,7 @@ async def main() -> None:
             if is_roblox:
                 asyncio.create_task(process_item_notification(session, items[0], is_lim))
 
+        # Boucle principale de détection
         while True:
             started = time.monotonic()
             items = await fetch_items(session)
@@ -264,11 +258,13 @@ async def main() -> None:
                     item_id = it["id"]
                     previous = state.get(item_id)
                     
+                    # Nouveau produit détecté
                     if previous is None:
                         state[item_id] = {"limited": is_lim}
-                        print(f"[new accessory] {it.get('name')} ({item_id}) | Limited: {is_lim}")
+                        print(f"[new item] {it.get('name')} ({item_id}) | Limited: {is_lim}")
                         asyncio.create_task(process_item_notification(session, it, is_lim))
                     else:
+                        # Passage de normal à Limited
                         if is_lim and not previous["limited"]:
                             state[item_id]["limited"] = True
                             print(f"[went limited] {it.get('name')} ({item_id})")
