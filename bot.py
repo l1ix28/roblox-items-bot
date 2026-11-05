@@ -69,6 +69,9 @@ PROXIES = [
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 CATEGORY = os.getenv("CATEGORY", "")  # vide = tous les items du créateur, 11 = accessoires
 CREATOR_ID = int(os.getenv("CREATOR_ID", "1"))  # 1 = Roblox officiel
+HEARTBEAT = float(os.getenv("HEARTBEAT_SECONDS", "30"))  # 0 = désactivé
+LOG_TOP = int(os.getenv("LOG_TOP", "5"))  # nb d'items affichés dans les logs
+PROXY_MIN_GAP = float(os.getenv("PROXY_MIN_GAP", "5"))  # secondes min entre 2 requêtes sur un même proxy
 MAX_AGE_HOURS = float(os.getenv("MAX_AGE_HOURS", "48"))  # ignore les "nouveaux" trop vieux
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
@@ -106,8 +109,74 @@ POLL_URL = catalog_url(POLL_LIMIT)
 
 # ----------------------------------------------------------------- state ----
 state: dict[int, bool] = {}  # asset id -> est limité
-proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
-cooldown_until = 0.0  # pause globale après un 429 (sans proxies)
+
+
+class ProxyPool:
+    """Répartit les requêtes sur les proxies et met de côté ceux qui prennent un 429."""
+
+    def __init__(self, proxies: list[str]) -> None:
+        self.gap = PROXY_MIN_GAP if proxies else 0.0
+        urls = proxies or [None]
+        self.slots = [
+            {"url": u, "name": f"proxy#{i + 1}" if u else "direct", "at": 0.0, "fails": 0}
+            for i, u in enumerate(urls)
+        ]
+        self.last_log = 0.0
+        self.limited_count = 0
+        self.ok_count = 0
+        self.err_count = 0
+        self.streak = 0  # échecs d'affilée
+        self.last_ok = 0.0
+
+    async def acquire(self) -> dict:
+        slot = min(self.slots, key=lambda x: x["at"])  # le proxy dispo le plus tôt
+        now = time.monotonic()
+        start = max(now, slot["at"])
+        slot["at"] = start + self.gap  # réservé : un autre worker prendra un autre proxy
+        if start > now:
+            await asyncio.sleep(start - now)
+        return slot
+
+    def limited(self, slot: dict, retry_after: float) -> float:
+        slot["fails"] += 1
+        self.streak += 1
+        delay = min(60.0, (retry_after + 1) * (1.5 ** (slot["fails"] - 1)))
+        slot["at"] = max(slot["at"], time.monotonic() + delay)
+        self.limited_count += 1
+        now = time.monotonic()
+        if now - self.last_log > 5:  # un seul log toutes les 5 s
+            self.last_log = now
+            paused = sum(1 for x in self.slots if x["at"] > now)
+            print(
+                f"[catalog] 429 ({self.limited_count} depuis le début) | "
+                f"{paused}/{len(self.slots)} proxies en pause, dernier: {slot['name']} {delay:.0f}s"
+            )
+        return delay
+
+    def failed(self, slot: dict) -> None:
+        self.err_count += 1
+        self.streak += 1
+        slot["at"] = max(slot["at"], time.monotonic() + 3)
+
+    def ok(self, slot: dict) -> None:
+        slot["fails"] = 0
+        self.ok_count += 1
+        if self.streak >= 3:
+            print(f"[recovered] requêtes OK de nouveau après {self.streak} échecs d'affilée")
+        self.streak = 0
+        self.last_ok = time.monotonic()
+
+
+pool = ProxyPool(PROXIES)
+latest: dict = {"items": []}  # dernière réponse valide du catalogue (pour les logs)
+
+
+def fmt_item(it: dict) -> str:
+    _, limited = check_item_status(it)
+    price = it.get("price") if it.get("price") is not None else it.get("lowestPrice")
+    tag = "LIMITED" if limited else "normal"
+    return f"  - {it.get('name', '?')} ({it.get('id')}) | {tag} | {format_price(price)}"
+
 last_status = 0  # dernier statut HTTP du catalogue (0 = erreur réseau)
 last_cursor = None  # curseur de la page suivante
 _tasks: set[asyncio.Task] = set()
@@ -280,32 +349,28 @@ async def notify(session: aiohttp.ClientSession, item: dict, is_limited: bool) -
 
 # ---------------------------------------------------------------- catalog ---
 async def fetch_items(session: aiohttp.ClientSession, url: str) -> list[dict] | None:
-    global cooldown_until, last_status, last_cursor
+    global last_status, last_cursor
     last_status = 0
     last_cursor = None
-    wait = cooldown_until - time.monotonic()
-    if wait > 0:
-        await asyncio.sleep(wait)
-
-    proxy = next(proxy_cycle) if proxy_cycle else None
+    slot = await pool.acquire()
     try:
-        async with session.get(url, headers=random_headers(), proxy=proxy) as r:
+        async with session.get(url, headers=random_headers(), proxy=slot["url"]) as r:
             last_status = r.status
             if r.status == 429:
-                retry = float(r.headers.get("retry-after", 3))
-                if not proxy_cycle:  # une seule IP : tout le monde se met en pause
-                    cooldown_until = time.monotonic() + retry
-                print(f"[catalog] rate limit ({retry}s)")
+                pool.limited(slot, float(r.headers.get("retry-after", 5)))
                 return None
             if r.status != 200:
                 body = (await r.text())[:150].replace("\n", " ")
-                print(f"[catalog] status {r.status} | {body}")
+                print(f"[catalog] status {r.status} on {slot['name']} | {body}")
+                pool.failed(slot)
                 return None
+            pool.ok(slot)
             body = _loads(await r.read())
             last_cursor = body.get("nextPageCursor")
             return body.get("data", [])
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[catalog] network error: {e!r}")
+        print(f"[catalog] network error on {slot['name']}: {e!r}")
+        pool.failed(slot)
         return None
 
 
@@ -352,6 +417,7 @@ async def worker(session: aiohttp.ClientSession, index: int) -> None:
         try:
             items = await fetch_items(session, POLL_URL)
             if items:
+                latest["items"] = items
                 for it in items:
                     handle_item(session, it)
         except Exception as e:  # un worker ne doit jamais mourir
@@ -372,6 +438,25 @@ async def start_health_server() -> None:
     port = int(os.getenv("PORT", "10000"))
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"[http] health check server on port {port}")
+
+
+async def heartbeat() -> None:
+    """Log périodique : prouve que le bot tourne et montre les derniers items vus."""
+    prev_ok = prev_rl = prev_err = 0
+    while True:
+        await asyncio.sleep(HEARTBEAT)
+        now = time.monotonic()
+        ok, rl, err = pool.ok_count, pool.limited_count, pool.err_count
+        active = sum(1 for x in pool.slots if x["at"] <= now)
+        since = f"{now - pool.last_ok:.0f}s" if pool.last_ok else "jamais"
+        print(
+            f"[status] sur {HEARTBEAT:.0f}s : {ok - prev_ok} OK, {rl - prev_rl} x 429, "
+            f"{err - prev_err} erreurs | dernier succès il y a {since} | "
+            f"proxies dispo {active}/{len(pool.slots)} | {len(state)} items suivis"
+        )
+        prev_ok, prev_rl, prev_err = ok, rl, err
+        for it in latest["items"][:LOG_TOP]:
+            print(fmt_item(it))
 
 
 async def main() -> None:
@@ -403,7 +488,18 @@ async def main() -> None:
             if ok:
                 state[it["id"]] = limited
                 first_match = first_match or (it, limited)
-        print(f"[init] {len(state)} items cached | workers={WORKERS} | interval={POLL_INTERVAL}s")
+        print(
+            f"[init] {len(state)} items cached | workers={WORKERS} | interval={POLL_INTERVAL}s"
+            f" | proxies={len(PROXIES)} (gap {PROXY_MIN_GAP}s)"
+        )
+
+        latest["items"] = items
+        print(f"[init] {min(LOG_TOP, len(items))} derniers items vus :")
+        for it in items[:LOG_TOP]:
+            print(fmt_item(it))
+
+        if HEARTBEAT > 0:
+            spawn(heartbeat())
 
         if TEST_ON_START and first_match:
             print("[test] sending startup test alert")
