@@ -72,7 +72,7 @@ CREATOR_ID = int(os.getenv("CREATOR_ID", "1"))  # 1 = Roblox officiel
 HEARTBEAT = float(os.getenv("HEARTBEAT_SECONDS", "30"))  # 0 = désactivé
 LOG_TOP = int(os.getenv("LOG_TOP", "5"))  # nb d'items affichés dans les logs
 PROXY_MIN_GAP = float(os.getenv("PROXY_MIN_GAP", "5"))  # secondes min entre 2 requêtes sur un même proxy
-MAX_AGE_HOURS = float(os.getenv("MAX_AGE_HOURS", "48"))  # ignore les "nouveaux" trop vieux
+MAX_AGE_HOURS = float(os.getenv("MAX_AGE_HOURS", "1440"))  # ignore les "nouveaux" trop vieux
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (limited-notifier)"}
 
