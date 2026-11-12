@@ -101,7 +101,7 @@ def catalog_url(limit: str | int) -> str:
     cat = f"Category={CATEGORY}&" if CATEGORY else ""
     return (
         "https://catalog.roblox.com/v1/search/items/details"
-        f"?{cat}CreatorType=User&CreatorTargetId={CREATOR_ID}&SortType=3&Limit={limit}"
+        f"?{cat}CreatorType=User&CreatorTargetId={CREATOR_ID}&SortType=3&Limit={limit}&IncludeNotForSale=true"
     )
 
 
