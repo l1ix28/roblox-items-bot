@@ -267,18 +267,22 @@ async def fetch_item_batch(session: aiohttp.ClientSession, asset_ids: list[int])
     slot = await pool.acquire()
     payload = {"items": [{"itemType": "Asset", "id": aid} for aid in asset_ids]}
     try:
-        async with session.post(DETAILS_URL, json=payload, headers=random_headers(), proxy=slot["url"]) as r:
+        proxy_url = slot["url"] if slot["url"] else None
+        async with session.post(DETAILS_URL, json=payload, headers=random_headers(), proxy=proxy_url) as r:
             last_status = r.status
             if r.status == 429:
                 pool.limited(slot, float(r.headers.get("retry-after", 5)))
                 return None
             if r.status != 200:
+                body_preview = (await r.text())[:150].replace("\n", " ")
+                print(f"[catalog POST] proxy={slot['name']} status={r.status} | {body_preview}")
                 pool.failed(slot)
                 return None
             pool.ok(slot)
             body = _loads(await r.read())
             return body.get("data", [])
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[catalog POST] proxy={slot['name']} error: {e!r}")
         pool.failed(slot)
         return None
 
@@ -362,7 +366,8 @@ async def main() -> None:
         highest_id = 0
         first_match = None
         try:
-            async with session.get(SEARCH_BOOT_URL, headers=random_headers(), proxy=slot["url"]) as r:
+            proxy_url = slot["url"] if slot["url"] else None
+            async with session.get(SEARCH_BOOT_URL, headers=random_headers(), proxy=proxy_url) as r:
                 if r.status == 200:
                     data = _loads(await r.read()).get("data", [])
                     if data:
