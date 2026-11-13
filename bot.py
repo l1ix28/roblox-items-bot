@@ -40,6 +40,7 @@ HEARTBEAT = float(os.getenv("HEARTBEAT_SECONDS", "30"))
 LOG_TOP = int(os.getenv("LOG_TOP", "5"))
 PROXY_MIN_GAP = float(os.getenv("PROXY_MIN_GAP", "5"))
 CREATOR_ID = int(os.getenv("CREATOR_ID", "1"))
+TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
 
 def parse_proxy(raw: str) -> str:
     raw = raw.strip()
@@ -359,6 +360,7 @@ async def main() -> None:
         print("[init] Recherche du dernier ID Roblox de référence...")
         slot = await pool.acquire()
         highest_id = 0
+        first_match = None
         try:
             async with session.get(SEARCH_BOOT_URL, headers=random_headers(), proxy=slot["url"]) as r:
                 if r.status == 200:
@@ -369,6 +371,7 @@ async def main() -> None:
                             ok, limited = check_item_status(it)
                             if ok:
                                 state[it["id"]] = limited
+                                first_match = first_match or (it, limited)
         except Exception as e:
             print(f"[init] Erreur boot search: {e}")
 
@@ -381,6 +384,10 @@ async def main() -> None:
 
         if HEARTBEAT > 0:
             spawn(heartbeat())
+
+        if TEST_ON_START and first_match:
+            print("[test] sending startup test alert")
+            spawn(notify(session, *first_match))
 
         await asyncio.gather(*(worker(session, i, current_id_holder) for i in range(WORKERS)))
 
