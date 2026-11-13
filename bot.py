@@ -265,24 +265,26 @@ async def fetch_item_batch(session: aiohttp.ClientSession, asset_ids: list[int])
     global last_status
     last_status = 0
     slot = await pool.acquire()
-    payload = {"items": [{"itemType": "Asset", "id": aid} for aid in asset_ids]}
+    # L'endpoint GET alternatif pour les détails d'assets en masse
+    ids_str = ",".join(map(str, asset_ids))
+    url = f"https://economy.roblox.com/v1/assets?assetIds={ids_str}"
     try:
         proxy_url = slot["url"] if slot["url"] else None
-        async with session.post(DETAILS_URL, json=payload, headers=random_headers(), proxy=proxy_url) as r:
+        async with session.get(url, headers=random_headers(), proxy=proxy_url) as r:
             last_status = r.status
             if r.status == 429:
                 pool.limited(slot, float(r.headers.get("retry-after", 5)))
                 return None
             if r.status != 200:
                 body_preview = (await r.text())[:150].replace("\n", " ")
-                print(f"[catalog POST] proxy={slot['name']} status={r.status} | {body_preview}")
+                print(f"[catalog GET] proxy={slot['name']} status={r.status} | {body_preview}")
                 pool.failed(slot)
                 return None
             pool.ok(slot)
             body = _loads(await r.read())
             return body.get("data", [])
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[catalog POST] proxy={slot['name']} error: {e!r}")
+        print(f"[catalog GET] proxy={slot['name']} error: {e!r}")
         pool.failed(slot)
         return None
 
