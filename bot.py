@@ -1,6 +1,6 @@
 """
 Roblox Official Asset ID Scanner & Notifier -> Discord webhook.
-Contourne le délai d'indexation de la recherche publique en scannant les ID bruts.
+Scanne les Asset IDs via GET en masse pour éviter les erreurs XSRF et contourner le délai d'indexation.
 Cible strictement les items officiels Roblox (CREATOR_ID = 1).
 """
 
@@ -66,7 +66,6 @@ USER_AGENTS = [
 def random_headers() -> dict:
     return {"User-Agent": random.choice(USER_AGENTS)}
 
-DETAILS_URL = "https://catalog.roblox.com/v1/catalog/items/details"
 SEARCH_BOOT_URL = f"https://catalog.roblox.com/v1/search/items/details?CreatorType=User&CreatorTargetId={CREATOR_ID}&SortType=3&Limit=30&IncludeNotForSale=true"
 
 SALE_LOCATIONS = {
@@ -265,7 +264,6 @@ async def fetch_item_batch(session: aiohttp.ClientSession, asset_ids: list[int])
     global last_status
     last_status = 0
     slot = await pool.acquire()
-    # L'endpoint GET alternatif pour les détails d'assets en masse
     ids_str = ",".join(map(str, asset_ids))
     url = f"https://economy.roblox.com/v1/assets?assetIds={ids_str}"
     try:
@@ -275,6 +273,9 @@ async def fetch_item_batch(session: aiohttp.ClientSession, asset_ids: list[int])
             if r.status == 429:
                 pool.limited(slot, float(r.headers.get("retry-after", 5)))
                 return None
+            if r.status == 404:
+                pool.ok(slot)
+                return []
             if r.status != 200:
                 body_preview = (await r.text())[:150].replace("\n", " ")
                 print(f"[catalog GET] proxy={slot['name']} status={r.status} | {body_preview}")
@@ -363,9 +364,10 @@ async def main() -> None:
     async with aiohttp.ClientSession(
         headers=HEADERS, timeout=aiohttp.ClientTimeout(total=6), connector=connector
     ) as session:
-        print("[init] Recherche du dernier ID Roblox de référence...")
+        print("[init] Initialisation du scanner sur les Asset IDs...")
+        highest_id = 1450000000  # Base réaliste pour éviter les faux ID de catalogue
+
         slot = await pool.acquire()
-        highest_id = 0
         first_match = None
         try:
             proxy_url = slot["url"] if slot["url"] else None
@@ -373,7 +375,6 @@ async def main() -> None:
                 if r.status == 200:
                     data = _loads(await r.read()).get("data", [])
                     if data:
-                        highest_id = max(it["id"] for it in data)
                         for it in data:
                             ok, limited = check_item_status(it)
                             if ok:
@@ -381,9 +382,6 @@ async def main() -> None:
                                 first_match = first_match or (it, limited)
         except Exception as e:
             print(f"[init] Erreur boot search: {e}")
-
-        if highest_id == 0:
-            highest_id = 11000000000
 
         current_id_holder = {"val": highest_id + 1}
         print(f"[init] Scanner d'ID démarré à partir de : {current_id_holder['val']}")
