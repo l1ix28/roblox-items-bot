@@ -3,10 +3,10 @@ Roblox Official Notifier (Limiteds + Normal Items) -> Discord webhook.
 Lecture seule de l'API publique du catalogue : aucune action sur ton compte.
 
 Optimisations vitesse :
-  - plusieurs workers décalés dans le temps (polling effectif = POLL_INTERVAL)
-  - envoi du webhook IMMEDIAT, la miniature est ajoutée ensuite par édition
-  - session HTTP persistante (keep-alive), orjson/uvloop si installés
-  - cache de démarrage large (Limit=120) pour éviter les faux "nouveaux items"
+- plusieurs workers décalés dans le temps (polling effectif = POLL_INTERVAL)
+- envoi du webhook IMMEDIAT, la miniature est ajoutée ensuite par édition
+- session HTTP persistante (keep-alive), orjson/uvloop si installés
+- cache de démarrage large (Limit=120) pour éviter les faux "nouveaux items"
 """
 
 import asyncio
@@ -67,7 +67,7 @@ PROXIES = [
     parse_proxy(p) for p in os.getenv("PROXIES", "").replace("\n", ",").split(",") if p.strip()
 ]
 TEST_ON_START = os.getenv("TEST_ON_START", "0") == "1"
-CATEGORY = os.getenv("CATEGORY", "")  # vide = tous les items du créateur, 11 = accessoires
+CATEGORY = os.getenv("CATEGORY", "1")  # 1 = toutes catégories (nécessaire pour le tri par date)
 CREATOR_ID = int(os.getenv("CREATOR_ID", "1"))  # 1 = Roblox officiel
 HEARTBEAT = float(os.getenv("HEARTBEAT_SECONDS", "30"))  # 0 = désactivé
 LOG_TOP = int(os.getenv("LOG_TOP", "5"))  # nb d'items affichés dans les logs
@@ -96,12 +96,15 @@ SALE_LOCATIONS = {
     "shopandexperiencesbyid": "Website and specific experiences",
 }
 
+LIMITS_CYCLE = itertools.cycle([10, 28, 30])
 
-def catalog_url(limit: str | int) -> str:
+
+def catalog_url(limit: str | int | None = None) -> str:
+    lim = limit if limit is not None else next(LIMITS_CYCLE)
     cat = f"Category={CATEGORY}&" if CATEGORY else ""
     return (
         "https://catalog.roblox.com/v1/search/items/details"
-        f"?{cat}CreatorType=User&CreatorTargetId={CREATOR_ID}&SortType=3&Limit={limit}&IncludeNotForSale=true"
+        f"?{cat}CreatorType=1&CreatorTargetId={CREATOR_ID}&SortType=3&Limit={lim}&IncludeNotForSale=true"
     )
 
 
@@ -199,13 +202,7 @@ def check_item_status(item: dict) -> tuple[bool, bool]:
     if item.get("creatorTargetId") != CREATOR_ID:
         return False, False
     restrictions = item.get("itemRestrictions") or []
-    total_qty = item.get("totalQuantity") or 0
-    limited = bool(
-        "Limited" in restrictions
-        or "LimitedUnique" in restrictions
-        or "Collectible" in restrictions
-        or (total_qty > 0 and item.get("collectibleItemId"))
-    )
+    limited = "Limited" in restrictions or "LimitedUnique" in restrictions
     return True, limited
 
 
@@ -383,18 +380,13 @@ def handle_item(session: aiohttp.ClientSession, item: dict) -> None:
     if not ok:
         return
     item_id = item["id"]
-    previous = state.get(item_id)
 
-    if previous is None:
+    if item_id not in state:
         state[item_id] = limited  # marqué AVANT tout await : pas de doublon entre workers
         if is_stale(item):
             return
         print(f"[new] {item.get('name')} ({item_id}) | limited={limited}")
         spawn(notify(session, item, limited))
-    elif limited and not previous:
-        state[item_id] = True
-        print(f"[went limited] {item.get('name')} ({item_id})")
-        spawn(notify(session, item, True))
 
 
 async def worker(session: aiohttp.ClientSession, index: int) -> None:
@@ -403,7 +395,7 @@ async def worker(session: aiohttp.ClientSession, index: int) -> None:
     while True:
         started = time.monotonic()
         try:
-            items = await fetch_items(session, POLL_URL)
+            items = await fetch_items(session, catalog_url())
             if items:
                 latest["items"] = items
                 for it in items:
